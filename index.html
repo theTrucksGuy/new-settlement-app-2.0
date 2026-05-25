@@ -1,0 +1,1700 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GRUBUS Settlement Engine</title>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf-autotable@3.6.0/dist/jspdf.plugin.autotable.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1f242d;
+    --border: #2a313d;
+    --text: #e7ebf2;
+    --muted: #93a0b3;
+    --accent: #f5c518;
+    --accent-2: #e94560;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 20px 28px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; background: var(--panel); }
+  header h1 { font-size: 20px; margin: 0; letter-spacing: 0.5px; }
+  header h1 span { color: var(--accent); }
+  header .meta { font-size: 12px; color: var(--muted); }
+  main { max-width: 1100px; margin: 0 auto; padding: 28px; }
+  .stepper { display: flex; gap: 6px; margin-bottom: 24px; flex-wrap: wrap; }
+  .stepper .pill { padding: 6px 12px; border-radius: 999px; background: var(--panel); border: 1px solid var(--border); font-size: 12px; color: var(--muted); }
+  .stepper .pill.active { background: var(--accent); color: #1a1a1a; border-color: var(--accent); font-weight: 600; }
+  .stepper .pill.done { background: var(--panel-2); color: var(--ok); border-color: var(--ok); }
+  section.card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 24px; margin-bottom: 20px; display: none; }
+  section.card.visible { display: block; }
+  h2 { margin: 0 0 16px 0; font-size: 18px; }
+  h3 { margin: 16px 0 8px 0; font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+  label { display: block; font-size: 13px; margin-bottom: 6px; color: var(--muted); }
+  input[type=text], input[type=number], input[type=date], select, textarea {
+    width: 100%; padding: 10px 12px; background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 8px; color: var(--text); font-size: 14px; font-family: inherit;
+  }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  button {
+    padding: 10px 18px; background: var(--accent); color: #1a1a1a; border: none; border-radius: 8px;
+    font-weight: 600; cursor: pointer; font-size: 14px;
+  }
+  button:hover { filter: brightness(1.1); }
+  button.secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
+  button.danger { background: var(--accent-2); color: #fff; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > * { flex: 1; min-width: 180px; }
+  .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
+  .actions.between { justify-content: space-between; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+  tr:hover td { background: var(--panel-2); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  .badge.ok { background: rgba(74,222,128,0.15); color: var(--ok); }
+  .badge.warn { background: rgba(251,191,36,0.15); color: var(--warn); }
+  .badge.bad { background: rgba(248,113,113,0.15); color: var(--bad); }
+  .badge.muted { background: var(--panel-2); color: var(--muted); }
+  .summary-grid { display: grid; grid-template-columns: 1fr auto; gap: 8px 24px; margin: 16px 0; }
+  .summary-grid .label { color: var(--muted); }
+  .summary-grid .value { text-align: right; font-variant-numeric: tabular-nums; }
+  .summary-grid .total { font-size: 18px; font-weight: 700; color: var(--accent); border-top: 2px solid var(--border); padding-top: 8px; margin-top: 4px; }
+  .summary-grid .total.negative { color: var(--bad); }
+  .info { background: rgba(245,197,24,0.08); border-left: 3px solid var(--accent); padding: 10px 14px; border-radius: 4px; margin: 12px 0; font-size: 13px; }
+  .warn-box { background: rgba(251,191,36,0.08); border-left: 3px solid var(--warn); padding: 10px 14px; border-radius: 4px; margin: 8px 0; font-size: 13px; }
+  .err-box { background: rgba(248,113,113,0.08); border-left: 3px solid var(--bad); padding: 10px 14px; border-radius: 4px; margin: 8px 0; font-size: 13px; color: var(--bad); }
+  .anomalies li { margin: 4px 0; color: var(--warn); font-size: 13px; }
+  .file-drop {
+    border: 2px dashed var(--border); border-radius: 12px; padding: 40px; text-align: center;
+    cursor: pointer; transition: 0.15s;
+  }
+  .file-drop:hover { border-color: var(--accent); background: rgba(245,197,24,0.04); }
+  .file-drop.has-file { border-color: var(--ok); background: rgba(74,222,128,0.04); }
+  .pill-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .check-row { display: flex; align-items: center; gap: 8px; padding: 8px; background: var(--panel-2); border-radius: 6px; margin: 4px 0; font-size: 13px; }
+  .num { font-variant-numeric: tabular-nums; }
+  .right { text-align: right; }
+  .center { text-align: center; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .trip-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin: 10px 0; }
+  .trip-card h4 { margin: 0 0 8px 0; }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  .toolbar { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+  .small { font-size: 12px; padding: 6px 10px; }
+  .removed { opacity: 0.4; text-decoration: line-through; }
+  details summary { cursor: pointer; padding: 8px 0; font-size: 13px; color: var(--muted); }
+  .currency::before { content: "₹ "; color: var(--muted); }
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 18px; }
+  .tabs .tab {
+    padding: 10px 16px; cursor: pointer; font-size: 13px; color: var(--muted);
+    border-bottom: 2px solid transparent; margin-bottom: -1px;
+  }
+  .tabs .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tabs .tab:hover:not(.active) { color: var(--text); }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+  .spinner {
+    display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin 0.7s linear infinite;
+    vertical-align: middle; margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  code { background: var(--panel-2); padding: 2px 6px; border-radius: 3px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>GRUBUS <span>Settlement Engine</span></h1>
+  <div class="meta">v1.0 &nbsp;·&nbsp; <span id="today-date"></span>
+    &nbsp;·&nbsp; <button class="secondary small" id="open-routes-btn" type="button" style="margin-left:6px">📋 Routes</button>
+  </div>
+</header>
+
+<!-- Routes modal -->
+<div id="routes-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:200;align-items:center;justify-content:center;padding:24px">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;width:min(820px,100%);max-height:90vh;overflow:auto;padding:22px;box-shadow:0 20px 60px rgba(0,0,0,0.4)">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px">
+      <div>
+        <h2 style="margin:0">📋 Routes</h2>
+        <p class="muted" style="margin:4px 0 0">Saved routes with separate driver rates for trucks and trailers. Stored locally in this browser.</p>
+      </div>
+      <button class="secondary small" type="button" onclick="closeRoutesModal()">✕</button>
+    </div>
+    <h3 style="margin-top:14px">Add a route</h3>
+    <div class="grid-3">
+      <input type="text" id="route-name-input" placeholder="Route name (e.g., DELHI → MUMBAI)" />
+      <input type="number" id="route-truck-rate" placeholder="Truck rate ₹" min="0" />
+      <input type="number" id="route-trailer-rate" placeholder="Trailer rate ₹" min="0" />
+    </div>
+    <div class="actions" style="justify-content:flex-start;margin-top:8px">
+      <button class="secondary small" type="button" onclick="addSavedRoute()">+ Add route</button>
+    </div>
+    <h3 style="margin-top:18px">Saved routes</h3>
+    <div id="saved-routes-list"></div>
+  </div>
+</div>
+
+<main>
+  <div class="stepper" id="stepper">
+    <div class="pill" data-step="0">Upload</div>
+    <div class="pill" data-step="1">Driver</div>
+    <div class="pill" data-step="2">Period</div>
+    <div class="pill" data-step="3">Trips</div>
+    <div class="pill" data-step="4">Advances</div>
+    <div class="pill" data-step="5">Per-Trip</div>
+    <div class="pill" data-step="6">Adjustments</div>
+    <div class="pill" data-step="7">Summary</div>
+    <div class="pill" data-step="8">Done</div>
+  </div>
+
+  <!-- Step 0: Connect Data Source -->
+  <section class="card visible" id="step-0">
+    <h2>Step 1 &mdash; Connect Data Source</h2>
+
+    <div class="tabs" id="source-tabs">
+      <div class="tab active" data-pane="sheets">Google Sheets</div>
+      <div class="tab" data-pane="xlsx">Upload XLSX (fallback)</div>
+    </div>
+
+    <!-- Google Sheets pane -->
+    <div class="tab-pane active" data-pane="sheets">
+      <p class="muted">Paste the Apps Script Web App URL. See <code>apps-script/SETUP.md</code> if you haven't deployed it yet.</p>
+      <label>Apps Script Web App URL</label>
+      <input type="text" id="proxy-url" placeholder="https://script.google.com/macros/s/.../exec" autocomplete="off" />
+      <div class="actions" style="justify-content:flex-start; margin-top:10px">
+        <button id="connect-btn">Connect &amp; load</button>
+        <button class="secondary" id="reload-btn" disabled>Refresh</button>
+      </div>
+      <div id="proxy-status" style="margin-top:14px"></div>
+      <div id="proxy-summary" style="margin-top:8px"></div>
+    </div>
+
+    <!-- XLSX pane -->
+    <div class="tab-pane" data-pane="xlsx">
+      <p class="muted">Drop in <code>Fleet_Operations_Master_Final.xlsx</code> (or click to choose). Reads Dispatch, Attendance, Routes, Repair Sheet, and Money Advance.</p>
+      <div class="file-drop" id="file-drop">
+        <input type="file" id="file-input" accept=".xlsx,.xls" style="display:none" />
+        <div id="file-drop-text">
+          <strong>Click or drop XLSX here</strong>
+          <div class="muted" style="margin-top:6px">No file chosen yet</div>
+        </div>
+      </div>
+      <div id="sheet-summary" style="margin-top:16px; display:none"></div>
+    </div>
+
+    <div class="actions">
+      <button id="to-step-1" disabled>Continue &rarr;</button>
+    </div>
+
+    <details style="margin-top:20px">
+      <summary>Local logs &amp; exports (XLSX mode)</summary>
+      <p class="muted">When using XLSX upload, logs live in this browser's local storage. In Google Sheets mode, the History sheet is the source of truth.</p>
+      <div class="toolbar">
+        <button class="secondary small" onclick="exportDriverLog()">Export Driver Log</button>
+        <button class="secondary small" onclick="exportTruckLog()">Export Truck Log</button>
+        <button class="secondary small" onclick="exportSettledIndex()">Export Settled Index</button>
+        <button class="danger small" onclick="resetLogs()">Reset local logs</button>
+      </div>
+      <div class="muted" id="storage-stats"></div>
+    </details>
+  </section>
+
+  <!-- Step 1: Driver -->
+  <section class="card" id="step-1">
+    <h2>Step 2 &mdash; Driver ID</h2>
+    <label>Driver ID (e.g. D02028)</label>
+    <input type="text" id="driver-id" placeholder="D02028" autocomplete="off" />
+    <div id="driver-info" style="margin-top:12px"></div>
+    <div class="actions between">
+      <button class="secondary" onclick="goStep(0)">&larr; Back</button>
+      <button id="to-step-2" disabled>Continue &rarr;</button>
+    </div>
+  </section>
+
+  <!-- Step 2: Period -->
+  <section class="card" id="step-2">
+    <h2>Step 3 &mdash; Settlement Period</h2>
+    <div class="info" id="period-info"></div>
+    <div class="row">
+      <div>
+        <label>Last settlement date</label>
+        <input type="date" id="last-settlement-date" />
+      </div>
+      <div>
+        <label>Today (period end)</label>
+        <input type="date" id="period-end" />
+      </div>
+    </div>
+    <div class="actions between">
+      <button class="secondary" onclick="goStep(1)">&larr; Back</button>
+      <button id="to-step-3">Fetch trips &rarr;</button>
+    </div>
+  </section>
+
+  <!-- Step 3: Trips -->
+  <section class="card" id="step-3">
+    <h2>Step 4 &mdash; Trips for the Period</h2>
+    <div id="trips-container"></div>
+    <h3 style="margin-top:24px">Add a missing trip</h3>
+    <div class="grid-3">
+      <input type="text" id="man-trip-no" placeholder="Trip Number" />
+      <input type="date" id="man-trip-date" />
+      <input type="text" id="man-trip-vehicle" placeholder="Vehicle (e.g. CG08AA6611)" />
+    </div>
+    <div class="grid-3" style="margin-top:8px">
+      <input type="text" id="man-trip-from" placeholder="From" />
+      <input type="text" id="man-trip-to" placeholder="To" />
+      <input type="text" id="man-trip-item" placeholder="Item" />
+    </div>
+    <div class="actions" style="justify-content:flex-start; margin-top:8px">
+      <button class="secondary small" onclick="addManualTrip()">+ Add manual trip</button>
+    </div>
+    <div class="actions between">
+      <button class="secondary" onclick="goStep(2)">&larr; Back</button>
+      <button id="to-step-4">Continue &rarr;</button>
+    </div>
+  </section>
+
+  <!-- Step 4: Advances -->
+  <section class="card" id="step-4">
+    <h2>Step 5 &mdash; Advances for the Period</h2>
+    <div id="advances-container"></div>
+    <h3 style="margin-top:24px">Add a missing advance</h3>
+    <div class="grid-3">
+      <input type="number" id="man-adv-amount" placeholder="Amount (₹)" />
+      <input type="date" id="man-adv-date" />
+      <select id="man-adv-mode">
+        <option value="Cash">Cash</option>
+        <option value="UPI">UPI</option>
+        <option value="Account">Account</option>
+      </select>
+    </div>
+    <div style="margin-top:8px">
+      <input type="text" id="man-adv-remark" placeholder="Reference / remark" />
+    </div>
+    <div class="actions" style="justify-content:flex-start; margin-top:8px">
+      <button class="secondary small" onclick="addManualAdvance()">+ Add manual advance</button>
+    </div>
+    <div class="actions between">
+      <button class="secondary" onclick="goStep(3)">&larr; Back</button>
+      <button id="to-step-5">Per-trip questions &rarr;</button>
+    </div>
+  </section>
+
+  <!-- Step 5: Per-Trip Loop -->
+  <section class="card" id="step-5">
+    <h2>Step 6 &mdash; Per-Trip Settlement</h2>
+    <div class="info" id="trip-loop-info"></div>
+    <div id="trip-loop-container"></div>
+    <div class="actions between">
+      <button class="secondary" onclick="goStep(4)">&larr; Back</button>
+      <button id="to-step-6">Final adjustments &rarr;</button>
+    </div>
+  </section>
+
+  <!-- Step 6: Adjustments -->
+  <section class="card" id="step-6">
+    <h2>Step 7 &mdash; Final Adjustments</h2>
+    <div class="grid-2">
+      <div>
+        <label>Incentive amount (₹)</label>
+        <input type="number" id="incentive-amount" value="0" min="0" />
+        <label style="margin-top:8px">Reason</label>
+        <input type="text" id="incentive-reason" placeholder="e.g. Customer praise, festival bonus" />
+      </div>
+      <div>
+        <label>Penalty amount (₹)</label>
+        <input type="number" id="penalty-amount" value="0" min="0" />
+        <label style="margin-top:8px">Reason</label>
+        <input type="text" id="penalty-reason" placeholder="e.g. Late return, damages" />
+      </div>
+    </div>
+    <div class="actions between">
+      <button class="secondary" onclick="goStep(5)">&larr; Back</button>
+      <button id="to-step-7">Review summary &rarr;</button>
+    </div>
+  </section>
+
+  <!-- Step 7: Summary -->
+  <section class="card" id="step-7">
+    <h2>Step 8 &mdash; Net Settlement</h2>
+    <div id="summary-header"></div>
+    <h3 style="margin-top:18px">Trip-wise breakdown</h3>
+    <div id="summary-trips"></div>
+    <h3 style="margin-top:24px">Deductions &amp; net</h3>
+    <div id="summary-grid" class="summary-grid"></div>
+    <div id="summary-warning"></div>
+    <div class="actions between">
+      <button class="secondary" onclick="goStep(6)">&larr; Back</button>
+      <button id="finalize-btn">Confirm &amp; Finalize</button>
+    </div>
+  </section>
+
+  <!-- Step 8: Done -->
+  <section class="card" id="step-8">
+    <h2>Settlement Finalized &nbsp;<span class="badge ok">DONE</span></h2>
+    <div id="done-output"></div>
+    <div class="toolbar" style="margin-top:18px">
+      <button onclick="downloadPdf()">Download PDF Statement</button>
+      <button class="secondary" onclick="exportDriverLog()">Export Driver Log</button>
+      <button class="secondary" onclick="exportTruckLog()">Export Truck Log</button>
+      <button class="secondary" onclick="newSettlement()">New Settlement</button>
+    </div>
+  </section>
+</main>
+
+<script>
+/* ============================================================
+   GRUBUS Settlement Engine — single-file web app
+   Implements spec sections 1-13
+============================================================ */
+
+const STORAGE = {
+  driverLog: 'grubus_driver_settlement_log',
+  driverSummary: 'grubus_driver_settlement_summary',
+  truckLog: 'grubus_truck_settlement_log',
+  settledIndex: 'grubus_settled_trips_index',
+  driverLastSettlement: 'grubus_driver_last_settlement',
+  proxyUrl: 'grubus_proxy_url',
+};
+
+const CONFIG = {
+  fixedRateMin: 2500,
+  fixedRateMax: 8000,
+  fixedRateStep: 500,
+  fixedRateDefault: 3500,
+  haltRateDefault: 300,
+  partialPctDefault: 50,
+  loadUnloadWarn: 5000,
+  repairsWarnPerTrip: 50000,
+  weightLossPct: 2,
+  kmHigh: 2000,
+  defaultPriorDays: 30,
+};
+
+const state = {
+  mode: null,            // 'sheets' | 'xlsx'
+  proxyUrl: '',
+  historyConfigured: false,  // true only when Apps Script has historySheetId set
+  workbook: null,
+  sheets: {},
+  settledIndex: {},      // { tripNo: {driverId, settlementId, settledOn} }
+  driver: null,
+  periodFrom: null,
+  periodTo: null,
+  trips: [],
+  advances: [],
+  tripInputs: [],
+  incentive: 0,
+  incentiveReason: '',
+  penalty: 0,
+  penaltyReason: '',
+  result: null,
+  // Locally-managed routes & vehicle-type memory
+  savedRoutes: [],        // [{name, truckRate, trailerRate}]
+  vehicleTypes: {},       // {vehicleNo: 'Truck' | 'Trailer'}
+};
+
+// ---------- Routes (locally persisted) ----------
+const ROUTES_KEY = 'traq_settlement_routes_v1';
+const VEHTYPES_KEY = 'traq_settlement_vehicleTypes_v1';
+
+function loadSavedRoutes() {
+  try { state.savedRoutes = JSON.parse(localStorage.getItem(ROUTES_KEY) || '[]'); }
+  catch (_) { state.savedRoutes = []; }
+  try { state.vehicleTypes = JSON.parse(localStorage.getItem(VEHTYPES_KEY) || '{}'); }
+  catch (_) { state.vehicleTypes = {}; }
+}
+function persistSavedRoutes() { localStorage.setItem(ROUTES_KEY, JSON.stringify(state.savedRoutes)); }
+function persistVehicleTypes() { localStorage.setItem(VEHTYPES_KEY, JSON.stringify(state.vehicleTypes)); }
+
+function openRoutesModal() {
+  $('routes-overlay').style.display = 'flex';
+  renderSavedRoutesList();
+}
+function closeRoutesModal() { $('routes-overlay').style.display = 'none'; }
+window.closeRoutesModal = closeRoutesModal;
+
+function renderSavedRoutesList() {
+  const c = $('saved-routes-list');
+  if (state.savedRoutes.length === 0) {
+    c.innerHTML = '<div class="muted">No routes saved yet. Add one above.</div>';
+    return;
+  }
+  let html = '<table><thead><tr><th>Route</th><th class="right">Truck rate</th><th class="right">Trailer rate</th><th></th></tr></thead><tbody>';
+  state.savedRoutes.forEach((r, i) => {
+    html += `<tr>
+      <td>${escapeHtmlSimple(r.name)}</td>
+      <td class="right num">${fmt(r.truckRate)}</td>
+      <td class="right num">${fmt(r.trailerRate)}</td>
+      <td><button class="danger small" type="button" onclick="deleteSavedRoute(${i})">Delete</button></td>
+    </tr>`;
+  });
+  html += '</tbody></table>';
+  c.innerHTML = html;
+}
+
+function escapeHtmlSimple(s) {
+  return String(s ?? '').replace(/[&<>"']/g, ch => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[ch]));
+}
+
+window.addSavedRoute = () => {
+  const name = ($('route-name-input').value || '').trim();
+  const truckRate = Number($('route-truck-rate').value || 0);
+  const trailerRate = Number($('route-trailer-rate').value || 0);
+  if (!name) { alert('Route name is required.'); return; }
+  if (truckRate <= 0 || trailerRate <= 0) { alert('Both truck rate and trailer rate must be positive.'); return; }
+  // Replace by name if duplicate
+  const existingIdx = state.savedRoutes.findIndex(r => r.name.toLowerCase() === name.toLowerCase());
+  if (existingIdx >= 0) state.savedRoutes[existingIdx] = { name, truckRate, trailerRate };
+  else state.savedRoutes.push({ name, truckRate, trailerRate });
+  persistSavedRoutes();
+  $('route-name-input').value = '';
+  $('route-truck-rate').value = '';
+  $('route-trailer-rate').value = '';
+  renderSavedRoutesList();
+  // Refresh trip cards if we're past step 4 — picker dropdowns must include the new route
+  if (state.tripInputs.length) renderTripLoop();
+};
+
+window.deleteSavedRoute = (idx) => {
+  if (!confirm('Delete this route?')) return;
+  state.savedRoutes.splice(idx, 1);
+  persistSavedRoutes();
+  renderSavedRoutesList();
+  if (state.tripInputs.length) renderTripLoop();
+};
+
+// ---------- helpers ----------
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => '₹' + Math.round(n).toLocaleString('en-IN');
+const fmtNum = (n) => Math.round(n).toLocaleString('en-IN');
+const today = () => new Date().toISOString().slice(0, 10);
+const minusDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() - n); return x.toISOString().slice(0, 10); };
+
+$('today-date').textContent = today();
+
+// Load locally-persisted routes + vehicle types, and wire the Routes header button + overlay close-on-backdrop.
+loadSavedRoutes();
+$('open-routes-btn').addEventListener('click', openRoutesModal);
+$('routes-overlay').addEventListener('click', (e) => { if (e.target.id === 'routes-overlay') closeRoutesModal(); });
+
+function loadStore(k, fallback) {
+  try { return JSON.parse(localStorage.getItem(k)) ?? fallback; } catch { return fallback; }
+}
+function saveStore(k, v) { localStorage.setItem(k, JSON.stringify(v)); }
+
+function refreshStorageStats() {
+  const drv = loadStore(STORAGE.driverLog, []);
+  const sum = loadStore(STORAGE.driverSummary, []);
+  const trk = loadStore(STORAGE.truckLog, []);
+  const idx = loadStore(STORAGE.settledIndex, {});
+  $('storage-stats').textContent = `Stored: ${drv.length} driver-log rows · ${sum.length} settlements · ${trk.length} truck-log rows · ${Object.keys(idx).length} settled trips`;
+}
+refreshStorageStats();
+
+function goStep(n) {
+  document.querySelectorAll('section.card').forEach(s => s.classList.remove('visible'));
+  $('step-' + n).classList.add('visible');
+  document.querySelectorAll('.stepper .pill').forEach(p => {
+    const s = parseInt(p.dataset.step);
+    p.classList.toggle('active', s === n);
+    p.classList.toggle('done', s < n);
+  });
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+// ---------- Source tabs (Google Sheets vs XLSX) ----------
+document.querySelectorAll('#source-tabs .tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('#source-tabs .tab').forEach(t => t.classList.toggle('active', t === tab));
+    const pane = tab.dataset.pane;
+    document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.dataset.pane === pane));
+  });
+});
+
+// Restore saved proxy URL
+$('proxy-url').value = localStorage.getItem(STORAGE.proxyUrl) || '';
+
+// ---------- Proxy helpers ----------
+function getProxyUrl() {
+  const u = ($('proxy-url').value || '').trim();
+  if (!u) throw new Error('Proxy URL is empty.');
+  if (!/^https:\/\/script\.google\.com\//.test(u)) throw new Error('URL must be a script.google.com /exec URL.');
+  return u;
+}
+
+async function proxyGet(action, params = {}) {
+  const url = new URL(getProxyUrl());
+  url.searchParams.set('action', action);
+  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+  const res = await fetch(url.toString(), { method: 'GET', redirect: 'follow' });
+  const json = await res.json();
+  if (!json.ok) throw new Error(json.error || 'Proxy GET failed');
+  return json.data;
+}
+
+async function proxyPost(action, body = {}) {
+  const res = await fetch(getProxyUrl(), {
+    method: 'POST',
+    redirect: 'follow',
+    // text/plain avoids CORS preflight; Apps Script reads e.postData.contents either way
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify({ action, ...body }),
+  });
+  const json = await res.json();
+  if (!json.ok) throw new Error(json.error || 'Proxy POST failed');
+  return json.data;
+}
+
+// ---------- Connect & load (Google Sheets mode) ----------
+$('connect-btn').addEventListener('click', () => connectAndLoad());
+$('reload-btn').addEventListener('click', () => connectAndLoad());
+
+async function connectAndLoad() {
+  const statusEl = $('proxy-status');
+  const summaryEl = $('proxy-summary');
+  const btn = $('connect-btn');
+  btn.disabled = true;
+  statusEl.innerHTML = '<div class="info"><span class="spinner"></span>Pinging proxy…</div>';
+  summaryEl.innerHTML = '';
+  try {
+    const url = getProxyUrl();
+    localStorage.setItem(STORAGE.proxyUrl, url);
+    state.proxyUrl = url;
+
+    const ping = await proxyGet('ping');
+    statusEl.innerHTML = '<div class="info"><span class="spinner"></span>Loading dispatch &amp; advances…</div>';
+
+    const [dispatch, advances, routes, repairs, attendance, settledRes] = await Promise.all([
+      proxyGet('read', { which: 'dispatch' }).then(r => r.rows || []),
+      proxyGet('read', { which: 'advances' }).then(r => r.rows || []),
+      ping.configured.routes ? proxyGet('read', { which: 'routes' }).then(r => r.rows || []) : Promise.resolve([]),
+      ping.configured.repairs ? proxyGet('read', { which: 'repairs' }).then(r => r.rows || []) : Promise.resolve([]),
+      ping.configured.attendance ? proxyGet('read', { which: 'attendance' }).then(r => r.rows || []) : Promise.resolve([]),
+      proxyPost('settledIndex'),
+    ]);
+
+    state.mode = 'sheets';
+    state.historyConfigured = !!ping.configured.history;
+    state.sheets = {
+      dispatch,
+      attendance,
+      attendancePrev: [],
+      routes,
+      repairs,
+      advances,
+    };
+    state.settledIndex = (settledRes && settledRes.settled) || {};
+
+    const cfg = ping.configured;
+    const cfgPills = Object.entries(cfg)
+      .map(([k, v]) => `<span class="badge ${v ? 'ok' : 'muted'}">${k}${v ? '' : ' (not set)'}</span>`).join(' ');
+    statusEl.innerHTML = `<div class="info"><strong>Connected.</strong> Server time: ${ping.time}</div>`;
+    summaryEl.innerHTML = `
+      <div class="muted">${cfgPills}</div>
+      <div style="margin-top:8px">
+        Dispatch: <strong>${dispatch.length}</strong> rows &nbsp;·&nbsp;
+        Advances: <strong>${advances.length}</strong> rows &nbsp;·&nbsp;
+        Routes: <strong>${routes.length}</strong> &nbsp;·&nbsp;
+        Repairs: <strong>${repairs.length}</strong> &nbsp;·&nbsp;
+        Attendance: <strong>${attendance.length}</strong> &nbsp;·&nbsp;
+        Settled trips on file: <strong>${Object.keys(state.settledIndex).length}</strong>
+      </div>
+    `;
+    $('to-step-1').disabled = false;
+    $('reload-btn').disabled = false;
+  } catch (err) {
+    statusEl.innerHTML = `<div class="err-box"><strong>Connection failed:</strong> ${err.message}</div>`;
+    $('to-step-1').disabled = true;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ---------- Excel parsing ----------
+function findSheet(wb, ...needles) {
+  for (const name of wb.SheetNames) {
+    const lc = name.toLowerCase();
+    if (needles.some(n => lc.includes(n.toLowerCase()))) return name;
+  }
+  return null;
+}
+
+function parseDate(v) {
+  if (v == null || v === '') return null;
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  if (typeof v === 'number') {
+    // Excel serial date
+    const d = new Date(Math.round((v - 25569) * 86400 * 1000));
+    return d.toISOString().slice(0, 10);
+  }
+  const s = String(v).trim();
+  // try DD-MM-YYYY, DD/MM/YYYY, YYYY-MM-DD
+  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  m = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{2,4})/);
+  if (m) {
+    let [_, d, mo, y] = m;
+    if (y.length === 2) y = '20' + y;
+    return `${y}-${mo.padStart(2,'0')}-${d.padStart(2,'0')}`;
+  }
+  const dt = new Date(s);
+  if (!isNaN(dt)) return dt.toISOString().slice(0, 10);
+  return null;
+}
+
+function readSheet(wb, name) {
+  if (!name) return [];
+  const sh = wb.Sheets[name];
+  return XLSX.utils.sheet_to_json(sh, { defval: '', raw: true });
+}
+
+function loadWorkbook(file) {
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const wb = XLSX.read(e.target.result, { type: 'array', cellDates: true });
+      state.workbook = wb;
+      state.mode = 'xlsx';
+      state.settledIndex = loadStore(STORAGE.settledIndex, {});
+      state.sheets = {
+        dispatch: readSheet(wb, findSheet(wb, 'dispatch')),
+        attendance: readSheet(wb, findSheet(wb, 'attendance') && !findSheet(wb,'attendance april') ? findSheet(wb,'attendance') : findSheet(wb,'attendance')),
+        attendancePrev: readSheet(wb, findSheet(wb, 'attendance april', 'attendance prev', 'attendance new')),
+        routes: readSheet(wb, findSheet(wb, 'route')),
+        repairs: readSheet(wb, findSheet(wb, 'repair')),
+        advances: readSheet(wb, findSheet(wb, 'money advance', 'advance')),
+      };
+      const counts = Object.entries(state.sheets).map(([k,v]) => `${k}: <strong>${v.length}</strong>`).join(' &nbsp;·&nbsp; ');
+      const sheetList = wb.SheetNames.map(n => `<span class="badge muted">${n}</span>`).join(' ');
+      $('sheet-summary').style.display = 'block';
+      $('sheet-summary').innerHTML = `
+        <div class="info"><strong>Loaded.</strong> ${counts}</div>
+        <div class="muted">Sheets in workbook: ${sheetList}</div>
+      `;
+      $('file-drop').classList.add('has-file');
+      $('file-drop-text').innerHTML = `<strong style="color:var(--ok)">✓ ${file.name}</strong><div class="muted">${(file.size/1024).toFixed(1)} KB</div>`;
+      $('to-step-1').disabled = false;
+    } catch (err) {
+      alert('Failed to read workbook: ' + err.message);
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+$('file-drop').addEventListener('click', () => $('file-input').click());
+$('file-drop').addEventListener('dragover', e => { e.preventDefault(); });
+$('file-drop').addEventListener('drop', e => {
+  e.preventDefault();
+  if (e.dataTransfer.files[0]) loadWorkbook(e.dataTransfer.files[0]);
+});
+$('file-input').addEventListener('change', e => {
+  if (e.target.files[0]) loadWorkbook(e.target.files[0]);
+});
+
+$('to-step-1').addEventListener('click', () => goStep(1));
+
+// ---------- Step 1: Driver lookup ----------
+function findDriver(driverId) {
+  const id = driverId.trim().toUpperCase();
+  // search attendance sheets for matching ID — flexible column names
+  for (const sheet of [state.sheets.attendance, state.sheets.attendancePrev]) {
+    for (const row of sheet) {
+      const idCol = Object.keys(row).find(k => /driver\s*id|emp\s*id/i.test(k));
+      const nameCol = Object.keys(row).find(k => /driver\s*name|^name$/i.test(k));
+      const phoneCol = Object.keys(row).find(k => /phone|mobile|contact/i.test(k));
+      if (idCol && String(row[idCol]).trim().toUpperCase() === id) {
+        return {
+          id,
+          name: nameCol ? String(row[nameCol]).trim() : '(unknown)',
+          phone: phoneCol ? String(row[phoneCol]).trim() : '',
+        };
+      }
+    }
+  }
+  // fallback: search Dispatch Sheet
+  for (const row of state.sheets.dispatch) {
+    const idCol = Object.keys(row).find(k => /driver\s*id/i.test(k));
+    const nameCol = Object.keys(row).find(k => /^driver$|driver\s*name/i.test(k));
+    if (idCol && String(row[idCol]).trim().toUpperCase() === id) {
+      return { id, name: nameCol ? String(row[nameCol]).trim() : '(unknown)', phone: '' };
+    }
+  }
+  return null;
+}
+
+$('driver-id').addEventListener('input', () => {
+  const v = $('driver-id').value.trim();
+  if (!v) {
+    $('driver-info').innerHTML = '';
+    $('to-step-2').disabled = true;
+    return;
+  }
+  const drv = findDriver(v);
+  if (drv) {
+    $('driver-info').innerHTML = `<div class="info"><strong>${drv.name}</strong> &nbsp;·&nbsp; ID: ${drv.id} ${drv.phone ? `&nbsp;·&nbsp; ${drv.phone}` : ''}</div>`;
+    $('to-step-2').disabled = false;
+    state.driver = drv;
+  } else {
+    $('driver-info').innerHTML = `<div class="err-box">Driver ID not found in Attendance or Dispatch.</div>`;
+    $('to-step-2').disabled = true;
+    state.driver = null;
+  }
+});
+
+$('to-step-2').addEventListener('click', async () => {
+  const fallback = minusDays(today(), CONFIG.defaultPriorDays);
+  let last = null;
+  try {
+    if (state.mode === 'sheets') {
+      const res = await proxyPost('lastSettlement', { driverId: state.driver.id });
+      last = res && res.lastDate ? String(res.lastDate).slice(0, 10) : null;
+    } else {
+      const map = loadStore(STORAGE.driverLastSettlement, {});
+      last = map[state.driver.id] || null;
+    }
+  } catch (err) {
+    console.warn('lastSettlement lookup failed:', err.message);
+  }
+  const useDate = last || fallback;
+  $('last-settlement-date').value = useDate;
+  $('period-end').value = today();
+  $('period-info').innerHTML = last
+    ? `Driver <strong>${state.driver.name}</strong>'s last settlement was on <strong>${last}</strong>. Adjust if needed.`
+    : `No prior settlement on record for <strong>${state.driver.name}</strong>. Defaulting to 30 days ago. Adjust if needed.`;
+  goStep(2);
+});
+
+// ---------- Step 2: Period → Step 3: Trips ----------
+function getCol(row, ...patterns) {
+  for (const p of patterns) {
+    const key = Object.keys(row).find(k => new RegExp(p, 'i').test(k));
+    if (key) return row[key];
+  }
+  return undefined;
+}
+
+function fetchTripsForDriver() {
+  const trips = [];
+  const from = state.periodFrom, to = state.periodTo;
+  for (const row of state.sheets.dispatch) {
+    const did = getCol(row, 'driver\\s*id');
+    if (!did || String(did).trim().toUpperCase() !== state.driver.id) continue;
+    const tStart = parseDate(getCol(row, 'trip\\s*start\\s*date', 'start\\s*date'));
+    if (!tStart) continue;
+    if (tStart <= from) continue;
+    if (tStart > to) continue;
+    const trip = {
+      tripNo: String(getCol(row, 'trip\\s*number', 'trip\\s*no') || '').trim(),
+      vehicle: String(getCol(row, 'vehicle\\s*no', '^vehicle') || '').trim(),
+      driverName: String(getCol(row, '^driver$', 'driver\\s*name') || '').trim(),
+      from: String(getCol(row, 'from\\s*location', '^from') || '').trim(),
+      to: String(getCol(row, 'to\\s*location', '^to$') || '').trim(),
+      item: String(getCol(row, '^item', 'commodity') || '').trim(),
+      tripStart: tStart,
+      tripEnd: parseDate(getCol(row, 'trip\\s*end\\s*date', 'end\\s*date')),
+      totalKm: Number(getCol(row, 'total\\s*km', '^km') || 0),
+      loadingWeight: Number(getCol(row, 'loading\\s*weight') || 0),
+      unloadingWeight: Number(getCol(row, 'unloading\\s*weight') || 0),
+      ratePerTonne: Number(getCol(row, 'rate\\s*per\\s*tonne') || 0),
+      freight: Number(getCol(row, 'freight\\s*amount') || 0),
+      status: String(getCol(row, 'trip\\s*status', '^status') || '').trim(),
+      lr: String(getCol(row, 'lr\\s*number', '^lr') || '').trim(),
+      consignor: String(getCol(row, 'consignor') || '').trim(),
+      consignee: String(getCol(row, 'consignee') || '').trim(),
+      removed: false,
+      manual: false,
+    };
+    trips.push(trip);
+  }
+  return trips;
+}
+
+function fetchAdvancesForDriver() {
+  const out = [];
+  for (const row of state.sheets.advances) {
+    const did = getCol(row, 'driver\\s*id');
+    if (!did || String(did).trim().toUpperCase() !== state.driver.id) continue;
+    const d = parseDate(getCol(row, 'date\\s*of\\s*payment', 'payment\\s*date', '^date'));
+    if (!d) continue;
+    if (d <= state.periodFrom) continue;
+    if (d > state.periodTo) continue;
+    out.push({
+      amount: Number(getCol(row, 'amount', 'advance') || 0),
+      date: d,
+      mode: String(getCol(row, 'payment\\s*mode', '^mode') || 'Cash').trim() || 'Cash',
+      type: String(getCol(row, '^type$', 'payment\\s*type', '^trip\\s*advance$') || '').trim(),
+      remark: String(getCol(row, 'reference', 'remark', 'note') || '').trim(),
+      removed: false,
+      manual: false,
+    });
+  }
+  return out;
+}
+
+// Trip Advance + Salary Advance are deducted from settlement;
+// Trip Settlement + Salary are not. Manual entries (no type) default to deductible.
+function isDeductibleAdvance(a) {
+  if (!a.type) return true;
+  const t = a.type.toLowerCase().trim();
+  return t === 'trip advance' || t === 'salary advance';
+}
+
+function fetchRepairsForVehicle(vehicle) {
+  const out = [];
+  for (const row of state.sheets.repairs) {
+    const v = getCol(row, 'vehicle');
+    if (!v || String(v).trim().toUpperCase() !== vehicle.toUpperCase()) continue;
+    const d = parseDate(getCol(row, '^date', 'repair\\s*date'));
+    if (!d || d <= state.periodFrom || d > state.periodTo) continue;
+    out.push({
+      date: d,
+      desc: String(getCol(row, 'description', 'repair', 'particulars') || '').trim(),
+      amount: Number(getCol(row, 'bill\\s*amount', '^amount') || 0),
+    });
+  }
+  return out;
+}
+
+function findRouteRate(from, to, item) {
+  for (const row of state.sheets.routes) {
+    const f = String(getCol(row, '^from') || '').trim().toUpperCase();
+    const t = String(getCol(row, '^to') || '').trim().toUpperCase();
+    const i = String(getCol(row, '^item', 'commodity') || '').trim().toUpperCase();
+    if (f === from.toUpperCase() && t === to.toUpperCase() && (!item || !i || i === item.toUpperCase())) {
+      return Number(getCol(row, 'fixed\\s*driver\\s*rate', 'driver\\s*rate') || 0);
+    }
+  }
+  return 0;
+}
+
+function attendanceForDate(driverId, date) {
+  // returns { vehicle, status } if present
+  const sheets = [state.sheets.attendance, state.sheets.attendancePrev];
+  for (const sheet of sheets) {
+    for (const row of sheet) {
+      const idCol = Object.keys(row).find(k => /driver\s*id|emp\s*id/i.test(k));
+      if (!idCol || String(row[idCol]).trim().toUpperCase() !== driverId) continue;
+      // attendance is column-per-day grid; try to match the date
+      for (const k of Object.keys(row)) {
+        const colDate = parseDate(k);
+        if (colDate && colDate === date) {
+          return { vehicle: String(row[k] || '').trim(), status: String(row[k] || '').trim() };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function detectAnomalies(trip) {
+  const flags = [];
+  if (state.settledIndex[trip.tripNo]) flags.push('Already settled');
+  if ((trip.status || '').toLowerCase() === 'closed' && !trip.freight) flags.push('Missing freight');
+  if (trip.totalKm === 0 && trip.from && trip.to && trip.from !== trip.to) flags.push('Missing KM');
+  if (trip.totalKm > CONFIG.kmHigh) flags.push(`KM looks wrong (${fmtNum(trip.totalKm)})`);
+  if (trip.loadingWeight > 0) {
+    const loss = (trip.loadingWeight - trip.unloadingWeight) / trip.loadingWeight * 100;
+    if (loss > CONFIG.weightLossPct) flags.push(`Weight loss ${loss.toFixed(1)}%`);
+  }
+  if (trip.tripEnd && trip.tripEnd < trip.tripStart) flags.push('Negative duration');
+  // Duplicate LR
+  if (trip.lr) {
+    const dups = state.trips.filter(t => t.lr === trip.lr && t !== trip).length;
+    if (dups > 0) flags.push('Duplicate LR');
+  }
+  // Driver-on-two-trucks-same-day (within fetched trips)
+  const sameDay = state.trips.filter(t => t.tripStart === trip.tripStart && t.vehicle && t.vehicle !== trip.vehicle && t !== trip);
+  if (sameDay.length > 0) flags.push('Driver on two trucks same day');
+  // Attendance check
+  const att = attendanceForDate(state.driver.id, trip.tripStart);
+  if (att) {
+    if (/^off$/i.test(att.status)) flags.push('Driver on OFF day');
+    else if (att.vehicle && trip.vehicle && att.vehicle.toUpperCase() !== trip.vehicle.toUpperCase()) {
+      flags.push(`Attendance shows ${att.vehicle}, not ${trip.vehicle}`);
+    }
+  }
+  return flags;
+}
+
+$('to-step-3').addEventListener('click', () => {
+  state.periodFrom = $('last-settlement-date').value;
+  state.periodTo = $('period-end').value;
+  if (!state.periodFrom || !state.periodTo) { alert('Both dates required'); return; }
+  if (state.periodFrom > state.periodTo) { alert('Last settlement date cannot be after today.'); return; }
+  if (state.periodFrom > today()) { alert('Last settlement date is in the future.'); return; }
+  state.trips = fetchTripsForDriver();
+  state.advances = fetchAdvancesForDriver();
+  renderTrips();
+  goStep(3);
+});
+
+function renderTrips() {
+  const c = $('trips-container');
+  if (state.trips.length === 0) {
+    c.innerHTML = `<div class="warn-box">No trips found for ${state.driver.name} between ${state.periodFrom} and ${state.periodTo}. You can still proceed to record advances + incentive/penalty.</div>`;
+    return;
+  }
+  let html = `<table><thead><tr><th style="width:28px"></th><th>#</th><th>Date</th><th>Trip No</th><th>Vehicle</th><th>Route</th><th class="right">Freight</th><th>Flags</th><th></th></tr></thead><tbody>`;
+  state.trips.forEach((t, i) => {
+    const flags = detectAnomalies(t);
+    const flagHtml = flags.map(f => `<span class="badge warn">${f}</span>`).join(' ') || '<span class="badge ok">ok</span>';
+    const isOpen = !!t.expanded;
+    const chevron = isOpen ? '▾' : '▸';
+    html += `<tr class="${t.removed ? 'removed' : ''}" style="cursor:pointer" onclick="toggleExpandTrip(event, ${i})">
+      <td style="text-align:center;color:var(--muted)">${chevron}</td>
+      <td>${i + 1}</td>
+      <td>${t.tripStart}</td>
+      <td>${t.tripNo}${t.manual ? ' <span class="badge muted">manual</span>' : ''}</td>
+      <td>${t.vehicle}</td>
+      <td>${t.from} → ${t.to}<br><span class="muted">${t.item}</span></td>
+      <td class="right num">${fmt(t.freight)}</td>
+      <td>${flagHtml}</td>
+      <td><button class="${t.removed ? '' : 'danger'} small" onclick="event.stopPropagation();toggleRemoveTrip(${i})">${t.removed ? 'Restore' : 'Remove'}</button></td>
+    </tr>`;
+    if (isOpen) {
+      const wtLoss = t.loadingWeight > 0 ? ((t.loadingWeight - t.unloadingWeight) / t.loadingWeight * 100).toFixed(1) + '%' : '—';
+      html += `<tr><td colspan="9" style="background:var(--panel-2);padding:14px 18px">
+        <div class="grid-3" style="font-size:13px;gap:14px">
+          <div><span class="muted">LR Number:</span> ${t.lr || '—'}</div>
+          <div><span class="muted">Status:</span> ${t.status || '—'}</div>
+          <div><span class="muted">Trip End:</span> ${t.tripEnd || '—'}</div>
+          <div><span class="muted">Consignor:</span> ${t.consignor || '—'}</div>
+          <div><span class="muted">Consignee:</span> ${t.consignee || '—'}</div>
+          <div><span class="muted">Item:</span> ${t.item || '—'}</div>
+          <div><span class="muted">Total KM:</span> ${t.totalKm ? fmtNum(t.totalKm) : '—'}</div>
+          <div><span class="muted">Loading Wt:</span> ${t.loadingWeight ? fmtNum(t.loadingWeight) : '—'}</div>
+          <div><span class="muted">Unloading Wt:</span> ${t.unloadingWeight ? fmtNum(t.unloadingWeight) : '—'}</div>
+          <div><span class="muted">Weight Loss:</span> ${wtLoss}</div>
+          <div><span class="muted">Rate/Tonne:</span> ${t.ratePerTonne ? fmt(t.ratePerTonne) : '—'}</div>
+          <div><span class="muted">Freight:</span> ${t.freight ? fmt(t.freight) : '—'}</div>
+        </div>
+      </td></tr>`;
+    }
+  });
+  html += '</tbody></table>';
+  c.innerHTML = html;
+}
+
+window.toggleRemoveTrip = (i) => { state.trips[i].removed = !state.trips[i].removed; renderTrips(); };
+window.toggleExpandTrip = (e, i) => {
+  // ignore clicks on the inner Remove/Restore button (it stopPropagation's, but be safe)
+  if (e && e.target && e.target.tagName === 'BUTTON') return;
+  state.trips[i].expanded = !state.trips[i].expanded;
+  renderTrips();
+};
+
+window.addManualTrip = () => {
+  const trip = {
+    tripNo: $('man-trip-no').value.trim() || `MAN-${Date.now()}`,
+    vehicle: $('man-trip-vehicle').value.trim().toUpperCase(),
+    driverName: state.driver.name,
+    from: $('man-trip-from').value.trim(),
+    to: $('man-trip-to').value.trim(),
+    item: $('man-trip-item').value.trim(),
+    tripStart: $('man-trip-date').value,
+    tripEnd: $('man-trip-date').value,
+    totalKm: 0, loadingWeight: 0, unloadingWeight: 0, ratePerTonne: 0, freight: 0,
+    status: 'Closed', lr: '', consignor: '', consignee: '',
+    removed: false, manual: true,
+  };
+  if (!trip.tripStart) { alert('Trip date is required'); return; }
+  state.trips.push(trip);
+  ['man-trip-no','man-trip-date','man-trip-vehicle','man-trip-from','man-trip-to','man-trip-item'].forEach(id => $(id).value = '');
+  renderTrips();
+};
+
+$('to-step-4').addEventListener('click', () => {
+  // block if any trip is already settled (and not removed)
+  const blocked = state.trips.filter(t => !t.removed && state.settledIndex[t.tripNo]);
+  if (blocked.length > 0) {
+    alert(`Cannot proceed — these trips are already settled: ${blocked.map(t => t.tripNo).join(', ')}. Remove them or reset the settled index.`);
+    return;
+  }
+  renderAdvances();
+  goStep(4);
+});
+
+// ---------- Advances ----------
+function renderAdvances() {
+  const c = $('advances-container');
+  if (state.advances.length === 0) {
+    c.innerHTML = `<div class="warn-box">No advances on file for this period. Add manually if needed.</div>`;
+    return;
+  }
+  const skipped = state.advances.filter(a => !a.removed && !isDeductibleAdvance(a))
+                                 .reduce((s, a) => s + a.amount, 0);
+  let html = `<table><thead><tr><th>Date</th><th>Type</th><th>Mode</th><th class="right">Amount</th><th>Remark</th><th></th></tr></thead><tbody>`;
+  state.advances.forEach((a, i) => {
+    const ded = isDeductibleAdvance(a);
+    const typeLabel = a.type || (a.manual ? 'Manual' : '(none)');
+    const typeBadge = `<span class="badge ${ded ? 'ok' : 'muted'}">${typeLabel}${ded ? '' : ' — not deducted'}</span>`;
+    html += `<tr class="${a.removed ? 'removed' : ''}">
+      <td>${a.date}</td>
+      <td>${typeBadge}</td>
+      <td><span class="badge ${a.mode === 'Cash' ? 'warn' : 'ok'}">${a.mode}</span></td>
+      <td class="right num">${fmt(a.amount)}</td>
+      <td>${a.remark || ''}${a.manual ? ' <span class="badge muted">manual</span>' : ''}</td>
+      <td><button class="${a.removed ? '' : 'danger'} small" onclick="toggleRemoveAdv(${i})">${a.removed ? 'Restore' : 'Remove'}</button></td>
+    </tr>`;
+  });
+  html += '</tbody></table>';
+  if (skipped > 0) {
+    html += `<div class="muted" style="margin-top:8px">Excluded from deductions (Trip Settlement / Salary entries): <strong>${fmt(skipped)}</strong></div>`;
+  }
+  c.innerHTML = html;
+}
+
+window.toggleRemoveAdv = (i) => { state.advances[i].removed = !state.advances[i].removed; renderAdvances(); };
+
+window.addManualAdvance = () => {
+  const amount = Number($('man-adv-amount').value);
+  const date = $('man-adv-date').value;
+  const mode = $('man-adv-mode').value;
+  const remark = $('man-adv-remark').value.trim();
+  if (!amount || amount <= 0) { alert('Amount must be > 0'); return; }
+  if (!date) { alert('Date required'); return; }
+  state.advances.push({ amount, date, mode, remark, removed: false, manual: true });
+  ['man-adv-amount','man-adv-date','man-adv-remark'].forEach(id => $(id).value = '');
+  renderAdvances();
+};
+
+$('to-step-5').addEventListener('click', () => {
+  // Validate advance modes
+  for (const a of state.advances) {
+    if (!a.removed && !['Cash','UPI','Account'].includes(a.mode)) {
+      alert(`Advance on ${a.date} has invalid mode "${a.mode}". Must be Cash, UPI, or Account.`);
+      return;
+    }
+  }
+  buildTripInputs();
+  renderTripLoop();
+  goStep(5);
+});
+
+// ---------- Per-trip inputs ----------
+function buildTripInputs() {
+  state.tripInputs = state.trips.filter(t => !t.removed).map(trip => {
+    const vehicleType = state.vehicleTypes[trip.vehicle] || 'Truck';
+    const suggestedRate = findRouteRate(trip.from, trip.to, trip.item) || CONFIG.fixedRateDefault;
+    const snappedRate = Math.max(CONFIG.fixedRateMin, Math.min(CONFIG.fixedRateMax,
+      Math.round(suggestedRate / CONFIG.fixedRateStep) * CONFIG.fixedRateStep));
+    const repairs = fetchRepairsForVehicle(trip.vehicle).map(r => ({ ...r, billAvailable: false }));
+    return {
+      trip,
+      vehicleType,                // 'Truck' | 'Trailer' — sticky per vehicle via localStorage
+      chosenRouteName: '',        // user-picked saved route (overrides snappedRate)
+      fixedRate: snappedRate,
+      includeLoadUnload: false,
+      loadUnloadAmount: 0,
+      haltDays: 0,
+      haltRate: CONFIG.haltRateDefault,
+      repairs,
+      tripType: 'Full',
+      partialPct: CONFIG.partialPctDefault,
+      confirmed: false,
+    };
+  });
+}
+
+// Recompute fixedRate based on chosenRouteName + vehicleType.
+// Bypasses the snap-to-step constraint when a saved-route rate is applied —
+// validateTripInput will tolerate it because the user explicitly opted in via the picker.
+function applySavedRouteRate(ti) {
+  if (!ti.chosenRouteName) return;
+  const r = state.savedRoutes.find(x => x.name === ti.chosenRouteName);
+  if (!r) return;
+  ti.fixedRate = ti.vehicleType === 'Trailer' ? r.trailerRate : r.truckRate;
+}
+
+function tripDuration(trip) {
+  if (!trip.tripStart || !trip.tripEnd) return 1;
+  const a = new Date(trip.tripStart), b = new Date(trip.tripEnd);
+  return Math.max(1, Math.round((b - a) / 86400000) + 1);
+}
+
+function calcTripSettlement(ti) {
+  const repairsTotal = ti.repairs.filter(r => r.billAvailable).reduce((s, r) => s + r.amount, 0);
+  const haltTotal = ti.haltDays * ti.haltRate;
+  const loadUnload = ti.includeLoadUnload ? ti.loadUnloadAmount : 0;
+  const factor = ti.tripType === 'Full' ? 1.0 : (ti.partialPct / 100);
+  // Partial-pct applies ONLY to the fixed driver rate. Halt allowance, loading/unloading,
+  // and repair reimbursements are paid in full regardless of trip-completion percentage.
+  const fixedPay = ti.fixedRate * factor;
+  const settlement = Math.round(fixedPay + loadUnload + repairsTotal + haltTotal);
+  return {
+    repairsTotal, haltTotal, loadUnload, fixedPay,
+    base: ti.fixedRate + loadUnload + repairsTotal + haltTotal,  // pre-pct base, kept for any UI that referenced it
+    settlement,
+  };
+}
+
+function validateTripInput(ti) {
+  const errs = [];
+  // Fixed rate — relaxed when a saved route is supplying the value (user explicitly opted in).
+  const usingSavedRoute = !!ti.chosenRouteName;
+  if (!usingSavedRoute) {
+    if (ti.fixedRate < CONFIG.fixedRateMin || ti.fixedRate > CONFIG.fixedRateMax) errs.push(`Fixed rate must be ₹${CONFIG.fixedRateMin}–₹${CONFIG.fixedRateMax}`);
+    if (ti.fixedRate % CONFIG.fixedRateStep !== 0) errs.push(`Fixed rate must be in ₹${CONFIG.fixedRateStep} steps`);
+  } else if (ti.fixedRate <= 0) {
+    errs.push('Fixed rate must be greater than 0');
+  }
+  if (ti.haltDays < 0) errs.push('Halt days cannot be negative');
+  if (ti.haltDays > tripDuration(ti.trip)) errs.push(`Halt days (${ti.haltDays}) > trip duration (${tripDuration(ti.trip)})`);
+  if (ti.includeLoadUnload && ti.loadUnloadAmount < 0) errs.push('Load/Unload amount cannot be negative');
+  if (ti.includeLoadUnload && ti.loadUnloadAmount > CONFIG.loadUnloadWarn) errs.push(`Load/Unload > ₹${CONFIG.loadUnloadWarn} — please confirm (warning)`);
+  const repairsTotal = ti.repairs.filter(r => r.billAvailable).reduce((s, r) => s + r.amount, 0);
+  if (repairsTotal > CONFIG.repairsWarnPerTrip) errs.push(`Repairs ₹${fmtNum(repairsTotal)} > warning threshold ₹${fmtNum(CONFIG.repairsWarnPerTrip)} — please confirm (warning)`);
+  if (ti.tripType === 'Partial' && (ti.partialPct < 1 || ti.partialPct > 100)) errs.push('Partial % must be 1–100');
+  return errs;
+}
+
+function renderTripLoop() {
+  const c = $('trip-loop-container');
+  $('trip-loop-info').textContent = `${state.tripInputs.length} trips queued. Fill in each card; settlement updates live.`;
+  if (state.tripInputs.length === 0) {
+    c.innerHTML = `<div class="warn-box">No trips to settle in this period.</div>`;
+    return;
+  }
+  c.innerHTML = state.tripInputs.map((ti, idx) => renderTripCard(ti, idx)).join('');
+  state.tripInputs.forEach((_, i) => attachTripCardListeners(i));
+}
+
+function renderTripCard(ti, idx) {
+  const calc = calcTripSettlement(ti);
+  const flags = detectAnomalies(ti.trip);
+  const flagHtml = flags.length ? `<div class="warn-box"><strong>Flags:</strong> ${flags.join(' · ')}</div>` : '';
+  const errs = validateTripInput(ti);
+  const errHtml = errs.length ? `<div class="err-box">${errs.join('<br>')}</div>` : '';
+  const repairsHtml = ti.repairs.length === 0 ? '<div class="muted">No repair entries on file for this vehicle in the period.</div>' :
+    ti.repairs.map((r, ri) => `
+      <div class="check-row">
+        <input type="checkbox" id="rep-${idx}-${ri}" ${r.billAvailable ? 'checked' : ''} onchange="setRepair(${idx},${ri},this.checked)" />
+        <label for="rep-${idx}-${ri}" style="margin:0;flex:1">${r.date} · ${r.desc || '(no description)'} · <strong>${fmt(r.amount)}</strong></label>
+      </div>
+    `).join('');
+  const routeOptions = ['<option value="">— pick a saved route —</option>']
+    .concat(state.savedRoutes.map(r => `<option value="${escapeHtmlSimple(r.name)}" ${ti.chosenRouteName === r.name ? 'selected' : ''}>${escapeHtmlSimple(r.name)} (T: ${fmt(r.truckRate)} / Tr: ${fmt(r.trailerRate)})</option>`))
+    .join('');
+  const rateLabel = ti.chosenRouteName
+    ? `Fixed Rate <span class="muted" style="font-weight:normal">(from saved route)</span>`
+    : `Fixed Rate (₹${CONFIG.fixedRateMin.toLocaleString('en-IN')}–₹${CONFIG.fixedRateMax.toLocaleString('en-IN')}, step ₹${CONFIG.fixedRateStep})`;
+  return `
+    <div class="trip-card" id="trip-card-${idx}">
+      <h4>Trip ${idx + 1} of ${state.tripInputs.length} &mdash; ${ti.trip.tripNo} <span class="muted">(${ti.trip.vehicle}, ${ti.trip.from} → ${ti.trip.to}, ${ti.trip.tripStart})</span></h4>
+      ${flagHtml}
+      <div class="grid-3">
+        <div>
+          <label>Vehicle Type</label>
+          <select data-field="vehicleType" data-idx="${idx}">
+            <option value="Truck"   ${ti.vehicleType === 'Truck'   ? 'selected' : ''}>Truck</option>
+            <option value="Trailer" ${ti.vehicleType === 'Trailer' ? 'selected' : ''}>Trailer</option>
+          </select>
+        </div>
+        <div>
+          <label>Saved Route (optional)</label>
+          <select data-field="chosenRouteName" data-idx="${idx}">${routeOptions}</select>
+        </div>
+        <div>
+          <label>${rateLabel}</label>
+          <input type="number" min="0" ${ti.chosenRouteName ? '' : `step="${CONFIG.fixedRateStep}"`} value="${ti.fixedRate}" data-field="fixedRate" data-idx="${idx}" />
+        </div>
+      </div>
+      <div class="grid-3" style="margin-top:8px">
+        <div>
+          <label>Trip Type</label>
+          <select data-field="tripType" data-idx="${idx}">
+            <option value="Full" ${ti.tripType === 'Full' ? 'selected' : ''}>Full</option>
+            <option value="Partial" ${ti.tripType === 'Partial' ? 'selected' : ''}>Partial</option>
+          </select>
+        </div>
+        <div>
+          <label>Partial % (if Partial)</label>
+          <input type="number" min="1" max="100" value="${ti.partialPct}" data-field="partialPct" data-idx="${idx}" ${ti.tripType === 'Full' ? 'disabled' : ''} />
+        </div>
+        <div></div>
+      </div>
+      <div class="grid-3" style="margin-top:8px">
+        <div>
+          <label>
+            <input type="checkbox" data-field="includeLoadUnload" data-idx="${idx}" ${ti.includeLoadUnload ? 'checked' : ''} />
+            Include Loading/Unloading
+          </label>
+          <input type="number" min="0" value="${ti.loadUnloadAmount}" data-field="loadUnloadAmount" data-idx="${idx}" placeholder="Amount" ${ti.includeLoadUnload ? '' : 'disabled'} />
+        </div>
+        <div>
+          <label>Halt Days (company-caused)</label>
+          <input type="number" min="0" value="${ti.haltDays}" data-field="haltDays" data-idx="${idx}" />
+        </div>
+        <div>
+          <label>Halt Rate / day (₹)</label>
+          <input type="number" min="0" value="${ti.haltRate}" data-field="haltRate" data-idx="${idx}" />
+        </div>
+      </div>
+      <h3 style="margin-top:14px">Repairs (only if bill available)</h3>
+      ${repairsHtml}
+      ${errHtml}
+      <div class="summary-grid" style="margin-top:14px">
+        <div class="label">Fixed</div><div class="value">${fmt(ti.fixedRate)}</div>
+        <div class="label">Loading/Unloading</div><div class="value">${fmt(calc.loadUnload)}</div>
+        <div class="label">Repairs (with bill)</div><div class="value">${fmt(calc.repairsTotal)}</div>
+        <div class="label">Halt (${ti.haltDays} × ${fmt(ti.haltRate)})</div><div class="value">${fmt(calc.haltTotal)}</div>
+        <div class="label">Trip type</div><div class="value">${ti.tripType}${ti.tripType === 'Partial' ? ' ' + ti.partialPct + '%' : ''}</div>
+        <div class="label total">Trip Settlement</div><div class="value total">${fmt(calc.settlement)}</div>
+      </div>
+    </div>
+  `;
+}
+
+function attachTripCardListeners(idx) {
+  document.querySelectorAll(`#trip-card-${idx} [data-field]`).forEach(el => {
+    el.addEventListener('change', updateTripField);
+    if (el.type === 'number' || el.type === 'text') el.addEventListener('input', updateTripField);
+  });
+}
+
+function updateTripField(e) {
+  const idx = parseInt(e.target.dataset.idx);
+  const field = e.target.dataset.field;
+  const ti = state.tripInputs[idx];
+  if (e.target.type === 'checkbox') ti[field] = e.target.checked;
+  else if (e.target.type === 'number') ti[field] = Number(e.target.value);
+  else ti[field] = e.target.value;
+
+  // Cross-field side effects
+  if (field === 'vehicleType') {
+    // Remember vehicle → type association across future settlements
+    state.vehicleTypes[ti.trip.vehicle] = ti.vehicleType;
+    persistVehicleTypes();
+    // If a saved route is selected, re-apply its rate for the new vehicle type
+    if (ti.chosenRouteName) applySavedRouteRate(ti);
+  }
+  if (field === 'chosenRouteName') {
+    if (ti.chosenRouteName) applySavedRouteRate(ti);
+    // Clearing the route does NOT roll back to the snap rate — leaves current fixedRate as-is.
+  }
+
+  // Re-render this card only
+  const fresh = renderTripCard(ti, idx);
+  $('trip-card-' + idx).outerHTML = fresh;
+  attachTripCardListeners(idx);
+}
+
+window.setRepair = (idx, ri, checked) => {
+  state.tripInputs[idx].repairs[ri].billAvailable = checked;
+  const fresh = renderTripCard(state.tripInputs[idx], idx);
+  $('trip-card-' + idx).outerHTML = fresh;
+  attachTripCardListeners(idx);
+};
+
+$('to-step-6').addEventListener('click', () => {
+  // block if any validation errors are present
+  for (let i = 0; i < state.tripInputs.length; i++) {
+    const errs = validateTripInput(state.tripInputs[i]);
+    const blocking = errs.filter(e => !/warning/i.test(e));
+    if (blocking.length) {
+      alert(`Trip ${i + 1} has errors: ${blocking.join(', ')}`);
+      return;
+    }
+  }
+  goStep(6);
+});
+
+// ---------- Step 7: Summary ----------
+$('to-step-7').addEventListener('click', () => {
+  state.incentive = Math.max(0, Number($('incentive-amount').value || 0));
+  state.incentiveReason = $('incentive-reason').value.trim();
+  state.penalty = Math.max(0, Number($('penalty-amount').value || 0));
+  state.penaltyReason = $('penalty-reason').value.trim();
+  renderSummary();
+  goStep(7);
+});
+
+function renderSummary() {
+  const trips = state.tripInputs.map(ti => ({ ti, calc: calcTripSettlement(ti) }));
+  const gross = trips.reduce((s, t) => s + t.calc.settlement, 0);
+  const cashAdv = state.advances.filter(a => !a.removed && a.mode === 'Cash' && isDeductibleAdvance(a)).reduce((s, a) => s + a.amount, 0);
+  const upiAdv = state.advances.filter(a => !a.removed && a.mode === 'UPI' && isDeductibleAdvance(a)).reduce((s, a) => s + a.amount, 0);
+  const accountAdv = state.advances.filter(a => !a.removed && a.mode === 'Account' && isDeductibleAdvance(a)).reduce((s, a) => s + a.amount, 0);
+  const net = gross + state.incentive - state.penalty - cashAdv - upiAdv - accountAdv;
+  state.result = { gross, cashAdv, upiAdv, accountAdv, net, trips };
+
+  const willWriteToSheet = (state.mode === 'sheets' && state.historyConfigured);
+  const destBanner = willWriteToSheet
+    ? ''
+    : `<div class="warn-box"><strong>No History sheet linked.</strong> On Finalize, this settlement will be saved to <strong>browser local storage</strong> instead. Use the Export buttons on the next screen to download the Driver Log / Truck Log / PDF.</div>`;
+  $('summary-header').innerHTML = `
+    <div class="info"><strong>${state.driver.name}</strong> (${state.driver.id}) &nbsp;·&nbsp; Period ${state.periodFrom} → ${state.periodTo} &nbsp;·&nbsp; ${trips.length} trips</div>
+    ${destBanner}
+  `;
+
+  if (trips.length === 0) {
+    $('summary-trips').innerHTML = `<div class="muted">No trips in this settlement.</div>`;
+  } else {
+    let tripRowsHtml = '';
+    trips.forEach(({ ti, calc }, i) => {
+      const t = ti.trip;
+      const pctLabel = ti.tripType === 'Full' ? '100%' : `${ti.partialPct}%`;
+      const haltLabel = `${ti.haltDays}d × ${fmt(ti.haltRate)}`;
+      tripRowsHtml += `
+        <div class="trip-card">
+          <h4>Trip ${i + 1} &mdash; ${t.tripNo}
+            <span class="muted">· ${t.tripStart}${t.tripEnd && t.tripEnd !== t.tripStart ? ` → ${t.tripEnd}` : ''}</span>
+          </h4>
+          <div class="grid-3" style="font-size:13px">
+            <div><span class="muted">Vehicle:</span> ${t.vehicle || '—'}</div>
+            <div><span class="muted">Route:</span> ${t.from || '—'} → ${t.to || '—'}</div>
+            <div><span class="muted">Item:</span> ${t.item || '—'}</div>
+          </div>
+          <div class="summary-grid" style="margin-top:10px">
+            <div class="label">Fixed rate</div><div class="value num">${fmt(ti.fixedRate)}</div>
+            <div class="label">Loading/Unloading</div><div class="value num">${fmt(calc.loadUnload)}</div>
+            <div class="label">Repairs (with bill)</div><div class="value num">${fmt(calc.repairsTotal)}</div>
+            <div class="label">Halt (${haltLabel})</div><div class="value num">${fmt(calc.haltTotal)}</div>
+            <div class="label">Trip type</div><div class="value">${ti.tripType}${ti.tripType === 'Partial' ? ' ' + pctLabel : ''}</div>
+            <div class="label total">Trip Settlement</div><div class="value total num">${fmt(calc.settlement)}</div>
+          </div>
+        </div>`;
+    });
+    tripRowsHtml += `
+      <div class="summary-grid" style="margin-top:14px">
+        <div class="label total">Gross trip settlements (${trips.length} trips)</div>
+        <div class="value total num">${fmt(gross)}</div>
+      </div>`;
+    $('summary-trips').innerHTML = tripRowsHtml;
+  }
+
+  $('summary-grid').innerHTML = `
+    <div class="label">Gross trip settlements</div><div class="value num">${fmt(gross)}</div>
+    <div class="label">Incentive ${state.incentiveReason ? `<span class="muted">— ${state.incentiveReason}</span>` : ''}</div><div class="value num">+ ${fmt(state.incentive)}</div>
+    <div class="label">Penalty ${state.penaltyReason ? `<span class="muted">— ${state.penaltyReason}</span>` : ''}</div><div class="value num">− ${fmt(state.penalty)}</div>
+    <div class="label">Cash advances</div><div class="value num">− ${fmt(cashAdv)}</div>
+    <div class="label">UPI advances</div><div class="value num">− ${fmt(upiAdv)}</div>
+    <div class="label">Account advances</div><div class="value num">− ${fmt(accountAdv)}</div>
+    <div class="label total ${net < 0 ? 'negative' : ''}">NET PAYABLE</div><div class="value total ${net < 0 ? 'negative' : ''} num">${fmt(net)}</div>
+  `;
+  $('summary-warning').innerHTML = net < 0
+    ? `<div class="err-box"><strong>Negative net.</strong> Driver carries balance forward of <strong>${fmt(-net)}</strong>.</div>`
+    : '';
+}
+
+// ---------- Step 8: Finalize ----------
+$('finalize-btn').addEventListener('click', finalize);
+
+function settlementId() {
+  const d = today().replace(/-/g, '');
+  const seq = (loadStore(STORAGE.driverSummary, []).length + 1).toString().padStart(3, '0');
+  return `S-${d}-${state.driver.id}-${seq}`;
+}
+
+function buildSettlementPayload(sId, finalizedOn) {
+  const { trips, gross, cashAdv, upiAdv, accountAdv, net } = state.result;
+
+  const driverLogRows = trips.map(({ ti, calc }) => ({
+    'Settlement ID': sId,
+    'Settlement Date': finalizedOn,
+    'Driver ID': state.driver.id,
+    'Driver Name': state.driver.name,
+    'Trip No': ti.trip.tripNo,
+    'Vehicle': ti.trip.vehicle,
+    'Trip Date': ti.trip.tripStart,
+    'Route': `${ti.trip.from} → ${ti.trip.to}`,
+    'Fixed Rate': ti.fixedRate,
+    'Loading/Unloading': calc.loadUnload,
+    'Halt Days': ti.haltDays,
+    'Halt Rate': ti.haltRate,
+    'Halt Total': calc.haltTotal,
+    'Repairs': calc.repairsTotal,
+    'Trip %': ti.tripType === 'Full' ? 100 : ti.partialPct,
+    'Trip Settlement': calc.settlement,
+    'Notes': ti.trip.manual ? 'Manual entry' : '',
+  }));
+
+  const summaryRow = {
+    'Settlement ID': sId,
+    'Date': finalizedOn,
+    'Driver ID': state.driver.id,
+    'Driver Name': state.driver.name,
+    'Period From': state.periodFrom,
+    'Period To': state.periodTo,
+    'Trip Count': trips.length,
+    'Gross': gross,
+    'Incentive': state.incentive,
+    'Incentive Reason': state.incentiveReason,
+    'Penalty': state.penalty,
+    'Penalty Reason': state.penaltyReason,
+    'Cash Advances': cashAdv,
+    'UPI Advances': upiAdv,
+    'Account Advances': accountAdv,
+    'Net Payable': net,
+  };
+
+  const byVehicle = {};
+  trips.forEach(({ ti, calc }) => {
+    const v = ti.trip.vehicle || '(unassigned)';
+    if (!byVehicle[v]) byVehicle[v] = { vehicle: v, drivers: new Set(), trips: 0, freight: 0, driverPay: 0, repairs: 0, loadUnload: 0, halt: 0 };
+    byVehicle[v].drivers.add(state.driver.name);
+    byVehicle[v].trips++;
+    byVehicle[v].freight += Number(ti.trip.freight) || 0;
+    byVehicle[v].driverPay += calc.settlement;
+    byVehicle[v].repairs += calc.repairsTotal;
+    byVehicle[v].loadUnload += calc.loadUnload;
+    byVehicle[v].halt += calc.haltTotal;
+  });
+  const truckLogRows = Object.values(byVehicle).map(v => ({
+    'Settlement ID': sId,
+    'Settlement Date': finalizedOn,
+    'Vehicle': v.vehicle,
+    'Driver(s)': [...v.drivers].join(', '),
+    'Period From': state.periodFrom,
+    'Period To': state.periodTo,
+    'Trips': v.trips,
+    'Total Freight': v.freight,
+    'Driver Pay Allocated': v.driverPay,
+    'Repair Cost': v.repairs,
+    'Loading/Unloading Cost': v.loadUnload,
+    'Halt Cost': v.halt,
+    'Net Margin': v.freight - v.driverPay - v.repairs - v.loadUnload - v.halt,
+  }));
+
+  const settledIndexRows = trips.map(({ ti }) => ({
+    'Trip No': ti.trip.tripNo,
+    'Driver ID': state.driver.id,
+    'Settlement ID': sId,
+    'Settled On': finalizedOn,
+  }));
+
+  return { driverLogRows, summaryRow, truckLogRows, settledIndexRows, byVehicle, trips };
+}
+
+async function finalize() {
+  const btn = $('finalize-btn');
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.innerHTML = '<span class="spinner"></span>Finalizing…';
+  try {
+    const sId = settlementId();
+    const finalizedOn = today();
+    const payload = buildSettlementPayload(sId, finalizedOn);
+
+    const writeToSheet = (state.mode === 'sheets' && state.historyConfigured);
+    if (writeToSheet) {
+      // POST all rows to the Apps Script proxy
+      await proxyPost('finalize', {
+        driverLogRows: payload.driverLogRows,
+        summaryRow: payload.summaryRow,
+        truckLogRows: payload.truckLogRows,
+        settledIndexRows: payload.settledIndexRows,
+      });
+      // Update in-memory settled index so subsequent settlements in the same session block re-settling
+      payload.settledIndexRows.forEach(r => {
+        state.settledIndex[r['Trip No']] = { driverId: r['Driver ID'], settlementId: r['Settlement ID'], settledOn: r['Settled On'] };
+      });
+    } else {
+      // No History sheet (or XLSX mode): persist in localStorage
+      const drvLog = loadStore(STORAGE.driverLog, []);
+      saveStore(STORAGE.driverLog, drvLog.concat(payload.driverLogRows));
+      const sumLog = loadStore(STORAGE.driverSummary, []);
+      saveStore(STORAGE.driverSummary, sumLog.concat([payload.summaryRow]));
+      const trkLog = loadStore(STORAGE.truckLog, []);
+      saveStore(STORAGE.truckLog, trkLog.concat(payload.truckLogRows));
+      const idx = loadStore(STORAGE.settledIndex, {});
+      payload.settledIndexRows.forEach(r => {
+        idx[r['Trip No']] = { driverId: r['Driver ID'], settlementId: r['Settlement ID'], settledOn: r['Settled On'] };
+      });
+      saveStore(STORAGE.settledIndex, idx);
+      state.settledIndex = idx;
+      const lastMap = loadStore(STORAGE.driverLastSettlement, {});
+      lastMap[state.driver.id] = finalizedOn;
+      saveStore(STORAGE.driverLastSettlement, lastMap);
+    }
+
+    state.result.settlementId = sId;
+    state.result.finalizedOn = finalizedOn;
+    const targetLabel = writeToSheet
+      ? 'Settlement History sheet'
+      : (state.mode === 'sheets'
+          ? 'browser local storage (no History sheet configured — use Export buttons to save)'
+          : 'browser local storage');
+    $('done-output').innerHTML = `
+      <div class="info">
+        <strong>Settlement ID:</strong> ${sId}<br>
+        <strong>${state.driver.name}</strong> (${state.driver.id}) &nbsp;·&nbsp; ${state.periodFrom} → ${state.periodTo} &nbsp;·&nbsp; ${payload.trips.length} trips<br>
+        <strong>Net payable:</strong> <span style="color:var(--accent);font-weight:700">${fmt(state.result.net)}</span>
+      </div>
+      <div class="muted" style="margin-top:6px">Written to: <strong>${targetLabel}</strong></div>
+      <div class="summary-grid" style="margin-top:14px">
+        <div class="label">Driver-log rows added</div><div class="value">${payload.driverLogRows.length}</div>
+        <div class="label">Truck-log rows added</div><div class="value">${payload.truckLogRows.length}</div>
+        <div class="label">Trips marked settled</div><div class="value">${payload.settledIndexRows.length}</div>
+      </div>
+    `;
+    refreshStorageStats();
+    goStep(8);
+  } catch (err) {
+    alert('Finalize failed: ' + err.message);
+    btn.disabled = false;
+    btn.textContent = original;
+    return;
+  }
+  btn.disabled = false;
+  btn.textContent = original;
+}
+
+// ---------- PDF Generation ----------
+function downloadPdf() {
+  if (!state.result) return;
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+  const w = doc.internal.pageSize.getWidth();
+
+  // Header
+  doc.setFillColor(15, 52, 96);
+  doc.rect(0, 0, w, 28, 'F');
+  doc.setTextColor(245, 197, 24);
+  doc.setFontSize(18);
+  doc.setFont('helvetica', 'bold');
+  doc.text('GRUBUS Trading Pvt Ltd', 14, 14);
+  doc.setTextColor(255, 255, 255);
+  doc.setFontSize(11);
+  doc.setFont('helvetica', 'normal');
+  doc.text('Driver Settlement Statement', 14, 22);
+
+  // Driver block
+  doc.setTextColor(0, 0, 0);
+  doc.setFontSize(10);
+  let y = 38;
+  doc.text(`Driver: ${state.driver.name}`, 14, y);
+  doc.text(`ID: ${state.driver.id}`, 105, y);
+  y += 6;
+  doc.text(`Phone: ${state.driver.phone || '—'}`, 14, y);
+  doc.text(`Settlement ID: ${state.result.settlementId}`, 105, y);
+  y += 6;
+  doc.text(`Period: ${state.periodFrom}  →  ${state.periodTo}`, 14, y);
+  doc.text(`Issued: ${state.result.finalizedOn}`, 105, y);
+  y += 8;
+
+  // Trip table
+  const tripRows = state.result.trips.map(({ ti, calc }, i) => [
+    i + 1,
+    ti.trip.tripStart,
+    ti.trip.tripNo,
+    ti.trip.vehicle,
+    `${ti.trip.from} → ${ti.trip.to}`,
+    fmtNum(ti.fixedRate),
+    fmtNum(calc.haltTotal),
+    fmtNum(calc.repairsTotal),
+    fmtNum(calc.loadUnload),
+    ti.tripType === 'Full' ? '100%' : ti.partialPct + '%',
+    fmtNum(calc.settlement),
+  ]);
+  doc.autoTable({
+    startY: y,
+    head: [['#', 'Date', 'Trip No', 'Vehicle', 'Route', 'Fixed', 'Halt', 'Repairs', 'L/UL', '%', 'Total ₹']],
+    body: tripRows,
+    styles: { fontSize: 8, cellPadding: 2 },
+    headStyles: { fillColor: [15, 52, 96], textColor: [245, 197, 24] },
+    columnStyles: { 5: { halign: 'right' }, 6: { halign: 'right' }, 7: { halign: 'right' }, 8: { halign: 'right' }, 10: { halign: 'right' } },
+  });
+  y = doc.lastAutoTable.finalY + 10;
+
+  // Summary
+  const r = state.result;
+  const sumLines = [
+    ['Gross trip settlements', fmtNum(r.gross)],
+    ['Incentive (+)', fmtNum(state.incentive) + (state.incentiveReason ? `  (${state.incentiveReason})` : '')],
+    ['Penalty (−)', fmtNum(state.penalty) + (state.penaltyReason ? `  (${state.penaltyReason})` : '')],
+    ['Cash advances (−)', fmtNum(r.cashAdv)],
+    ['UPI advances (−)', fmtNum(r.upiAdv)],
+    ['Account advances (−)', fmtNum(r.accountAdv)],
+    ['NET PAYABLE', fmtNum(r.net)],
+  ];
+  doc.autoTable({
+    startY: y,
+    body: sumLines,
+    styles: { fontSize: 10, cellPadding: 3 },
+    columnStyles: { 0: { cellWidth: 70 }, 1: { halign: 'right', fontStyle: 'bold' } },
+    didParseCell: (data) => {
+      if (data.row.index === sumLines.length - 1) {
+        data.cell.styles.fontStyle = 'bold';
+        data.cell.styles.fillColor = [245, 197, 24];
+        data.cell.styles.textColor = [0, 0, 0];
+        data.cell.styles.fontSize = 12;
+      }
+    },
+  });
+  y = doc.lastAutoTable.finalY + 14;
+
+  doc.setFontSize(8);
+  doc.setTextColor(120, 120, 120);
+  doc.text('Disputes within 7 days. Authorized signatory required for payment release.', 14, y);
+  y += 5;
+  doc.text(`Settlement ID: ${state.result.settlementId}  ·  Generated ${new Date().toISOString()}`, 14, y);
+
+  doc.save(`Settlement_${state.driver.id}_${state.result.finalizedOn.replace(/-/g, '')}.pdf`);
+}
+
+// ---------- Exports ----------
+function downloadXlsx(rows, sheetName, filename) {
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.json_to_sheet(rows);
+  XLSX.utils.book_append_sheet(wb, ws, sheetName);
+  XLSX.writeFile(wb, filename);
+}
+
+function exportDriverLog() {
+  const rows = loadStore(STORAGE.driverLog, []);
+  const summary = loadStore(STORAGE.driverSummary, []);
+  if (rows.length === 0 && summary.length === 0) { alert('Driver log is empty.'); return; }
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), 'Driver Log');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summary), 'Settlements Summary');
+  XLSX.writeFile(wb, `Driver_Settlement_Log_${today().replace(/-/g, '')}.xlsx`);
+}
+function exportTruckLog() {
+  const rows = loadStore(STORAGE.truckLog, []);
+  if (rows.length === 0) { alert('Truck log is empty.'); return; }
+  downloadXlsx(rows, 'Truck Log', `Truck_Settlement_Log_${today().replace(/-/g, '')}.xlsx`);
+}
+function exportSettledIndex() {
+  const idx = loadStore(STORAGE.settledIndex, {});
+  const rows = Object.entries(idx).map(([tripNo, v]) => ({ 'Trip No': tripNo, 'Driver ID': v.driverId, 'Settlement ID': v.settlementId, 'Settled On': v.settledOn }));
+  if (rows.length === 0) { alert('Settled index is empty.'); return; }
+  downloadXlsx(rows, 'Settled Trips', `Settled_Trips_Index_${today().replace(/-/g, '')}.xlsx`);
+}
+function resetLogs() {
+  if (!confirm('Reset ALL settlement logs and the settled-trips index? This cannot be undone.')) return;
+  Object.values(STORAGE).forEach(k => localStorage.removeItem(k));
+  refreshStorageStats();
+  alert('Logs cleared.');
+}
+function newSettlement() {
+  state.driver = null;
+  state.trips = [];
+  state.advances = [];
+  state.tripInputs = [];
+  state.result = null;
+  $('driver-id').value = '';
+  $('driver-info').innerHTML = '';
+  $('to-step-2').disabled = true;
+  goStep(1);
+}
+window.exportDriverLog = exportDriverLog;
+window.exportTruckLog = exportTruckLog;
+window.exportSettledIndex = exportSettledIndex;
+window.resetLogs = resetLogs;
+window.newSettlement = newSettlement;
+window.downloadPdf = downloadPdf;
+</script>
+</body>
+</html>
