@@ -9,49 +9,50 @@
  *   POST {action:"settledIndex"}            settled-trips index
  *   POST {action:"finalize", ...rows}       append driver-log + summary + truck + index rows
  *
- * Sources: dispatch | advances | routes | repairs | attendance |
+ * Sources: dispatch | settlementData | driverDetails | allVehicle |
  *          historyTrip | historySummary | historyTruck | historyIndex
  *
  * Setup is documented in SETUP.md.
  */
 
 const CONFIG = {
-  /* REQUIRED — paste the sheet IDs from your spreadsheet URLs.
-     A URL like https://docs.google.com/spreadsheets/d/1AbCdEf.../edit
-     has the ID 1AbCdEf...                                              */
-  dispatchSheetId: '',          // Dispatch Google Sheet ID
-  advancesSheetId: '',          // Advances Google Sheet ID
+  /* REQUIRED — the ONE workbook that holds Dispatch, Settlement Data and
+     Driver Details (the "PROFIT & LOSS DASHBOARD" sheet). Paste its ID from
+     the URL: https://docs.google.com/spreadsheets/d/1AbCdEf.../edit → 1AbCdEf */
+  workbookId: '',               // PROFIT & LOSS DASHBOARD Google Sheet ID
+
+  /* Settlement History lives in its OWN separate sheet (finalized output).   */
   historySheetId: '',           // Settlement History Google Sheet ID
 
-  /* Tab names. Defaults to "Sheet1" — change if your tab is named differently.
-     The four History tabs are auto-created on first finalize if missing.   */
-  dispatchTab: 'Sheet1',
-  advancesTab: 'Sheet1',
+  /* Tab names inside the workbook above.                                     */
+  dispatchTab: 'DISPATCH SHEET',
+  settlementDataTab: 'Settlement Data',
+  driverDetailsTab: 'Driver Details',
+  allVehicleTab: 'All Vehicle',
+
+  /* History tabs (separate sheet). Auto-created on first finalize if missing.*/
   historyTripTab: 'Driver Log',
   historySummaryTab: 'Settlements Summary',
   historyTruckTab: 'Truck Log',
   historyIndexTab: 'Settled Trips Index',
-
-  /* OPTIONAL — leave blank if you don't have these yet.
-     Spec §2 also references Routes, Repair Sheet, and Attendance.        */
-  routesSheetId: '',
-  routesTab: 'Sheet1',
-  repairsSheetId: '',
-  repairsTab: 'Sheet1',
-  attendanceSheetId: '',
-  attendanceTab: 'Sheet1',
 };
 
 const SOURCES = {
-  dispatch:       () => [CONFIG.dispatchSheetId,   CONFIG.dispatchTab],
-  advances:       () => [CONFIG.advancesSheetId,   CONFIG.advancesTab],
-  routes:         () => [CONFIG.routesSheetId,     CONFIG.routesTab],
-  repairs:        () => [CONFIG.repairsSheetId,    CONFIG.repairsTab],
-  attendance:     () => [CONFIG.attendanceSheetId, CONFIG.attendanceTab],
+  dispatch:       () => [CONFIG.workbookId,        CONFIG.dispatchTab],
+  settlementData: () => [CONFIG.workbookId,        CONFIG.settlementDataTab],
+  driverDetails:  () => [CONFIG.workbookId,        CONFIG.driverDetailsTab],
+  allVehicle:     () => [CONFIG.workbookId,        CONFIG.allVehicleTab],
   historyTrip:    () => [CONFIG.historySheetId,    CONFIG.historyTripTab],
   historySummary: () => [CONFIG.historySheetId,    CONFIG.historySummaryTab],
   historyTruck:   () => [CONFIG.historySheetId,    CONFIG.historyTruckTab],
   historyIndex:   () => [CONFIG.historySheetId,    CONFIG.historyIndexTab],
+};
+
+// Some tabs carry a banner/metadata row above the real header. Map source →
+// 1-based row that holds the column headers (default 1). Settlement Data has a
+// Start/End-date banner on row 1, so its headers are on row 2.
+const HEADER_ROW = {
+  settlementData: 2,
 };
 
 function doGet(e) {
@@ -62,12 +63,11 @@ function doGet(e) {
         ok: true,
         time: new Date().toISOString(),
         configured: {
-          dispatch: !!CONFIG.dispatchSheetId,
-          advances: !!CONFIG.advancesSheetId,
-          history:  !!CONFIG.historySheetId,
-          routes:   !!CONFIG.routesSheetId,
-          repairs:  !!CONFIG.repairsSheetId,
-          attendance: !!CONFIG.attendanceSheetId,
+          dispatch:       !!CONFIG.workbookId,
+          settlementData: !!CONFIG.workbookId,
+          driverDetails:  !!CONFIG.workbookId,
+          allVehicle:     !!CONFIG.workbookId,
+          history:        !!CONFIG.historySheetId,
         },
       };
     }
@@ -134,11 +134,12 @@ function readTab_(which) {
   const sh = ss.getSheetByName(tab);
   if (!sh) return [];                      // tab missing → empty
   const data = sh.getDataRange().getValues();
-  if (data.length < 2) return [];
+  const hdr = HEADER_ROW[which] || 1;      // 1-based header row (skips banner rows)
+  if (data.length < hdr + 1) return [];
   const tz = Session.getScriptTimeZone();
-  const headers = data[0].map(h => String(h).trim());
+  const headers = data[hdr - 1].map(h => String(h).trim());
   const out = [];
-  for (let i = 1; i < data.length; i++) {
+  for (let i = hdr; i < data.length; i++) {
     const row = data[i];
     let hasValue = false;
     const o = {};

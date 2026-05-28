@@ -130,10 +130,16 @@
       <button class="secondary small" type="button" onclick="closeRoutesModal()">✕</button>
     </div>
     <h3 style="margin-top:14px">Add a route</h3>
+    <p class="muted" style="margin:0 0 8px">From &amp; To are matched against each trip's locations to auto-fill its rate.</p>
     <div class="grid-3">
-      <input type="text" id="route-name-input" placeholder="Route name (e.g., DELHI → MUMBAI)" />
+      <input type="text" id="route-from-input" placeholder="From location" />
+      <input type="text" id="route-to-input" placeholder="To location" />
+      <input type="text" id="route-name-input" placeholder="Route name (optional)" />
+    </div>
+    <div class="grid-3" style="margin-top:8px">
       <input type="number" id="route-truck-rate" placeholder="Truck rate ₹" min="0" />
       <input type="number" id="route-trailer-rate" placeholder="Trailer rate ₹" min="0" />
+      <div></div>
     </div>
     <div class="actions" style="justify-content:flex-start;margin-top:8px">
       <button class="secondary small" type="button" onclick="addSavedRoute()">+ Add route</button>
@@ -401,7 +407,8 @@ const state = {
   result: null,
   // Locally-managed routes & vehicle-type memory
   savedRoutes: [],        // [{name, truckRate, trailerRate}]
-  vehicleTypes: {},       // {vehicleNo: 'Truck' | 'Trailer'}
+  vehicleTypes: {},       // {vehicleNo: 'Truck' | 'Trailer'} — manual user overrides (localStorage)
+  vehicleClass: {},       // {vehicleNo: 'Truck' | 'Trailer'} — derived from All Vehicle wheel count
 };
 
 // ---------- Routes (locally persisted) ----------
@@ -430,9 +437,11 @@ function renderSavedRoutesList() {
     c.innerHTML = '<div class="muted">No routes saved yet. Add one above.</div>';
     return;
   }
-  let html = '<table><thead><tr><th>Route</th><th class="right">Truck rate</th><th class="right">Trailer rate</th><th></th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>From → To</th><th>Name</th><th class="right">Truck rate</th><th class="right">Trailer rate</th><th></th></tr></thead><tbody>';
   state.savedRoutes.forEach((r, i) => {
+    const fromTo = (r.from || r.to) ? `${escapeHtmlSimple(r.from || '—')} → ${escapeHtmlSimple(r.to || '—')}` : '<span class="muted">(no match keys)</span>';
     html += `<tr>
+      <td>${fromTo}</td>
       <td>${escapeHtmlSimple(r.name)}</td>
       <td class="right num">${fmt(r.truckRate)}</td>
       <td class="right num">${fmt(r.trailerRate)}</td>
@@ -448,16 +457,24 @@ function escapeHtmlSimple(s) {
 }
 
 window.addSavedRoute = () => {
-  const name = ($('route-name-input').value || '').trim();
+  const from = ($('route-from-input').value || '').trim();
+  const to = ($('route-to-input').value || '').trim();
+  let name = ($('route-name-input').value || '').trim();
   const truckRate = Number($('route-truck-rate').value || 0);
   const trailerRate = Number($('route-trailer-rate').value || 0);
-  if (!name) { alert('Route name is required.'); return; }
+  if (!from || !to) { alert('From and To locations are required.'); return; }
+  if (!name) name = `${from} → ${to}`;   // auto-name from the route
   if (truckRate <= 0 || trailerRate <= 0) { alert('Both truck rate and trailer rate must be positive.'); return; }
-  // Replace by name if duplicate
-  const existingIdx = state.savedRoutes.findIndex(r => r.name.toLowerCase() === name.toLowerCase());
-  if (existingIdx >= 0) state.savedRoutes[existingIdx] = { name, truckRate, trailerRate };
-  else state.savedRoutes.push({ name, truckRate, trailerRate });
+  // Replace by matching From+To if it already exists
+  const existingIdx = state.savedRoutes.findIndex(r =>
+    String(r.from || '').trim().toLowerCase() === from.toLowerCase() &&
+    String(r.to || '').trim().toLowerCase() === to.toLowerCase());
+  const route = { name, from, to, truckRate, trailerRate };
+  if (existingIdx >= 0) state.savedRoutes[existingIdx] = route;
+  else state.savedRoutes.push(route);
   persistSavedRoutes();
+  $('route-from-input').value = '';
+  $('route-to-input').value = '';
   $('route-name-input').value = '';
   $('route-truck-rate').value = '';
   $('route-trailer-rate').value = '';
@@ -573,14 +590,13 @@ async function connectAndLoad() {
     state.proxyUrl = url;
 
     const ping = await proxyGet('ping');
-    statusEl.innerHTML = '<div class="info"><span class="spinner"></span>Loading dispatch &amp; advances…</div>';
+    statusEl.innerHTML = '<div class="info"><span class="spinner"></span>Loading dispatch, settlement data &amp; drivers…</div>';
 
-    const [dispatch, advances, routes, repairs, attendance, settledRes] = await Promise.all([
+    const [dispatch, advances, driverDetails, allVehicle, settledRes] = await Promise.all([
       proxyGet('read', { which: 'dispatch' }).then(r => r.rows || []),
-      proxyGet('read', { which: 'advances' }).then(r => r.rows || []),
-      ping.configured.routes ? proxyGet('read', { which: 'routes' }).then(r => r.rows || []) : Promise.resolve([]),
-      ping.configured.repairs ? proxyGet('read', { which: 'repairs' }).then(r => r.rows || []) : Promise.resolve([]),
-      ping.configured.attendance ? proxyGet('read', { which: 'attendance' }).then(r => r.rows || []) : Promise.resolve([]),
+      proxyGet('read', { which: 'settlementData' }).then(r => r.rows || []),
+      proxyGet('read', { which: 'driverDetails' }).then(r => r.rows || []),
+      proxyGet('read', { which: 'allVehicle' }).then(r => r.rows || []),
       proxyPost('settledIndex'),
     ]);
 
@@ -588,12 +604,14 @@ async function connectAndLoad() {
     state.historyConfigured = !!ping.configured.history;
     state.sheets = {
       dispatch,
-      attendance,
+      driverDetails,
+      attendance: [],
       attendancePrev: [],
-      routes,
-      repairs,
+      routes: [],
+      repairs: [],
       advances,
     };
+    state.vehicleClass = buildVehicleClass(allVehicle);
     state.settledIndex = (settledRes && settledRes.settled) || {};
 
     const cfg = ping.configured;
@@ -604,10 +622,9 @@ async function connectAndLoad() {
       <div class="muted">${cfgPills}</div>
       <div style="margin-top:8px">
         Dispatch: <strong>${dispatch.length}</strong> rows &nbsp;·&nbsp;
-        Advances: <strong>${advances.length}</strong> rows &nbsp;·&nbsp;
-        Routes: <strong>${routes.length}</strong> &nbsp;·&nbsp;
-        Repairs: <strong>${repairs.length}</strong> &nbsp;·&nbsp;
-        Attendance: <strong>${attendance.length}</strong> &nbsp;·&nbsp;
+        Settlement Data: <strong>${advances.length}</strong> rows &nbsp;·&nbsp;
+        Driver Details: <strong>${driverDetails.length}</strong> &nbsp;·&nbsp;
+        Vehicles classified: <strong>${Object.keys(state.vehicleClass).length}</strong> &nbsp;·&nbsp;
         Settled trips on file: <strong>${Object.keys(state.settledIndex).length}</strong>
       </div>
     `;
@@ -653,10 +670,10 @@ function parseDate(v) {
   return null;
 }
 
-function readSheet(wb, name) {
+function readSheet(wb, name, opts) {
   if (!name) return [];
   const sh = wb.Sheets[name];
-  return XLSX.utils.sheet_to_json(sh, { defval: '', raw: true });
+  return XLSX.utils.sheet_to_json(sh, Object.assign({ defval: '', raw: true }, opts || {}));
 }
 
 function loadWorkbook(file) {
@@ -669,12 +686,15 @@ function loadWorkbook(file) {
       state.settledIndex = loadStore(STORAGE.settledIndex, {});
       state.sheets = {
         dispatch: readSheet(wb, findSheet(wb, 'dispatch')),
-        attendance: readSheet(wb, findSheet(wb, 'attendance') && !findSheet(wb,'attendance april') ? findSheet(wb,'attendance') : findSheet(wb,'attendance')),
-        attendancePrev: readSheet(wb, findSheet(wb, 'attendance april', 'attendance prev', 'attendance new')),
-        routes: readSheet(wb, findSheet(wb, 'route')),
-        repairs: readSheet(wb, findSheet(wb, 'repair')),
-        advances: readSheet(wb, findSheet(wb, 'money advance', 'advance')),
+        driverDetails: readSheet(wb, findSheet(wb, 'driver detail')),
+        attendance: [],
+        attendancePrev: [],
+        routes: [],
+        repairs: [],
+        // Settlement Data has a Start/End-date banner on row 1 → headers on row 2.
+        advances: readSheet(wb, findSheet(wb, 'settlement data'), { range: 1 }),
       };
+      state.vehicleClass = buildVehicleClass(readSheet(wb, findSheet(wb, 'all vehicle')));
       const counts = Object.entries(state.sheets).map(([k,v]) => `${k}: <strong>${v.length}</strong>`).join(' &nbsp;·&nbsp; ');
       const sheetList = wb.SheetNames.map(n => `<span class="badge muted">${n}</span>`).join(' ');
       $('sheet-summary').style.display = 'block';
@@ -707,22 +727,20 @@ $('to-step-1').addEventListener('click', () => goStep(1));
 // ---------- Step 1: Driver lookup ----------
 function findDriver(driverId) {
   const id = driverId.trim().toUpperCase();
-  // search attendance sheets for matching ID — flexible column names
-  for (const sheet of [state.sheets.attendance, state.sheets.attendancePrev]) {
-    for (const row of sheet) {
-      const idCol = Object.keys(row).find(k => /driver\s*id|emp\s*id/i.test(k));
-      const nameCol = Object.keys(row).find(k => /driver\s*name|^name$/i.test(k));
-      const phoneCol = Object.keys(row).find(k => /phone|mobile|contact/i.test(k));
-      if (idCol && String(row[idCol]).trim().toUpperCase() === id) {
-        return {
-          id,
-          name: nameCol ? String(row[nameCol]).trim() : '(unknown)',
-          phone: phoneCol ? String(row[phoneCol]).trim() : '',
-        };
-      }
+  // Primary: the Driver Details sheet (ID NO / NAME / MOBILE NO)
+  for (const row of state.sheets.driverDetails || []) {
+    const idCol = Object.keys(row).find(k => /id\s*no|driver\s*id|emp\s*id|^id$/i.test(k));
+    const nameCol = Object.keys(row).find(k => /^name$|driver\s*name/i.test(k));
+    const phoneCol = Object.keys(row).find(k => /mobile|phone|contact/i.test(k));
+    if (idCol && String(row[idCol]).trim().toUpperCase() === id) {
+      return {
+        id,
+        name: nameCol ? String(row[nameCol]).trim() : '(unknown)',
+        phone: phoneCol ? String(row[phoneCol]).trim() : '',
+      };
     }
   }
-  // fallback: search Dispatch Sheet
+  // Fallback: Dispatch Sheet (name only — no phone there)
   for (const row of state.sheets.dispatch) {
     const idCol = Object.keys(row).find(k => /driver\s*id/i.test(k));
     const nameCol = Object.keys(row).find(k => /^driver$|driver\s*name/i.test(k));
@@ -746,7 +764,7 @@ $('driver-id').addEventListener('input', () => {
     $('to-step-2').disabled = false;
     state.driver = drv;
   } else {
-    $('driver-info').innerHTML = `<div class="err-box">Driver ID not found in Attendance or Dispatch.</div>`;
+    $('driver-info').innerHTML = `<div class="err-box">Driver ID not found in Driver Details or Dispatch.</div>`;
     $('to-step-2').disabled = true;
     state.driver = null;
   }
@@ -803,6 +821,8 @@ function fetchTripsForDriver() {
       item: String(getCol(row, '^item', 'commodity') || '').trim(),
       tripStart: tStart,
       tripEnd: parseDate(getCol(row, 'trip\\s*end\\s*date', 'end\\s*date')),
+      startKm: Number(getCol(row, 'start\\s*km') || 0),
+      endKm: Number(getCol(row, 'end\\s*km') || 0),
       totalKm: Number(getCol(row, 'total\\s*km', '^km') || 0),
       loadingWeight: Number(getCol(row, 'loading\\s*weight') || 0),
       unloadingWeight: Number(getCol(row, 'unloading\\s*weight') || 0),
@@ -820,6 +840,21 @@ function fetchTripsForDriver() {
   return trips;
 }
 
+// Settlement Data uses short Payment Type codes — map them to the full strings
+// the deduction logic understands. TA=Trip Advance, SL ADV=Salary Advance (both
+// deducted); TS=Trip Settlement, SL=Salary (both excluded).
+function normalizePaymentType(raw) {
+  const t = String(raw || '').trim().toUpperCase().replace(/\s+/g, ' ');
+  if (t === 'TA') return 'Trip Advance';
+  if (t === 'SL ADV' || t === 'SLADV') return 'Salary Advance';
+  if (t === 'TS') return 'Trip Settlement';
+  if (t === 'SL') return 'Salary';
+  return String(raw || '').trim();
+}
+
+// Reads the "Settlement Data" sheet. Each row holds a payment split across three
+// amount columns; the non-zero column implies the mode (Advance→Account, UPI→UPI,
+// Cash→Cash). One row can therefore yield up to three advance entries.
 function fetchAdvancesForDriver() {
   const out = [];
   for (const row of state.sheets.advances) {
@@ -829,25 +864,28 @@ function fetchAdvancesForDriver() {
     if (!d) continue;
     if (d <= state.periodFrom) continue;
     if (d > state.periodTo) continue;
-    out.push({
-      amount: Number(getCol(row, 'amount', 'advance') || 0),
-      date: d,
-      mode: String(getCol(row, 'payment\\s*mode', '^mode') || 'Cash').trim() || 'Cash',
-      type: String(getCol(row, '^type$', 'payment\\s*type', '^trip\\s*advance$') || '').trim(),
-      remark: String(getCol(row, 'reference', 'remark', 'note') || '').trim(),
-      removed: false,
-      manual: false,
-    });
+
+    const type = normalizePaymentType(getCol(row, 'payment\\s*type', '^type$'));
+    const remark = String(getCol(row, 'purpose', 'route', 'reference', 'remark', 'note') || '').trim();
+    const channels = [
+      { mode: 'Account', amount: Number(getCol(row, 'advance\\s*amount') || 0) },
+      { mode: 'UPI',     amount: Number(getCol(row, 'upi\\s*amount') || 0) },
+      { mode: 'Cash',    amount: Number(getCol(row, 'cash\\s*amount') || 0) },
+    ];
+    for (const c of channels) {
+      if (!c.amount) continue;
+      out.push({ amount: c.amount, date: d, mode: c.mode, type, remark, removed: false, manual: false });
+    }
   }
   return out;
 }
 
-// Trip Advance + Salary Advance are deducted from settlement;
-// Trip Settlement + Salary are not. Manual entries (no type) default to deductible.
+// Every payment disbursed to the driver is recovered as an advance — Trip Advance,
+// Salary Advance, and UPI/Cash disbursements all reduce the payout. Only Trip
+// Settlement (the payout itself) and Salary are NOT deducted. Blank type → deductible.
 function isDeductibleAdvance(a) {
-  if (!a.type) return true;
-  const t = a.type.toLowerCase().trim();
-  return t === 'trip advance' || t === 'salary advance';
+  const t = (a.type || '').toLowerCase().trim();
+  return t !== 'trip settlement' && t !== 'salary';
 }
 
 function fetchRepairsForVehicle(vehicle) {
@@ -967,12 +1005,13 @@ function renderTrips() {
       html += `<tr><td colspan="9" style="background:var(--panel-2);padding:14px 18px">
         <div class="grid-3" style="font-size:13px;gap:14px">
           <div><span class="muted">LR Number:</span> ${t.lr || '—'}</div>
-          <div><span class="muted">Status:</span> ${t.status || '—'}</div>
+          <div><span class="muted">Trip Start:</span> ${t.tripStart || '—'}</div>
           <div><span class="muted">Trip End:</span> ${t.tripEnd || '—'}</div>
-          <div><span class="muted">Consignor:</span> ${t.consignor || '—'}</div>
-          <div><span class="muted">Consignee:</span> ${t.consignee || '—'}</div>
+          <div><span class="muted">Total Days:</span> ${tripDuration(t)}</div>
+          <div><span class="muted">Start KM:</span> ${t.startKm ? fmtNum(t.startKm) : '—'}</div>
+          <div><span class="muted">End KM:</span> ${t.endKm ? fmtNum(t.endKm) : '—'}</div>
+          <div><span class="muted">KMs Ran:</span> ${t.totalKm ? fmtNum(t.totalKm) : '—'}</div>
           <div><span class="muted">Item:</span> ${t.item || '—'}</div>
-          <div><span class="muted">Total KM:</span> ${t.totalKm ? fmtNum(t.totalKm) : '—'}</div>
           <div><span class="muted">Loading Wt:</span> ${t.loadingWeight ? fmtNum(t.loadingWeight) : '—'}</div>
           <div><span class="muted">Unloading Wt:</span> ${t.unloadingWeight ? fmtNum(t.unloadingWeight) : '—'}</div>
           <div><span class="muted">Weight Loss:</span> ${wtLoss}</div>
@@ -1004,7 +1043,7 @@ window.addManualTrip = () => {
     item: $('man-trip-item').value.trim(),
     tripStart: $('man-trip-date').value,
     tripEnd: $('man-trip-date').value,
-    totalKm: 0, loadingWeight: 0, unloadingWeight: 0, ratePerTonne: 0, freight: 0,
+    startKm: 0, endKm: 0, totalKm: 0, loadingWeight: 0, unloadingWeight: 0, ratePerTonne: 0, freight: 0,
     status: 'Closed', lr: '', consignor: '', consignee: '',
     removed: false, manual: true,
   };
@@ -1083,18 +1122,65 @@ $('to-step-5').addEventListener('click', () => {
 });
 
 // ---------- Per-trip inputs ----------
+function tripKey(t) { return `${t.tripNo}|${t.vehicle}|${t.tripStart}|${t.from}|${t.to}`; }
+
+// Classify vehicles from the "All Vehicle" sheet's wheel count:
+// 18 wheels → Trailer; 12/14/16 (any positive count < 18) → Truck. Blank/"-" left unclassified.
+function buildVehicleClass(rows) {
+  const map = {};
+  for (const row of rows || []) {
+    const v = String(getCol(row, 'vehicle\\s*number', '^vehicle') || '').trim().toUpperCase();
+    if (!v) continue;
+    const wheels = Number(getCol(row, 'truck\\s*wheels', 'wheel') || 0);
+    if (!wheels) continue;
+    map[v] = wheels >= 18 ? 'Trailer' : 'Truck';
+  }
+  return map;
+}
+
+// Find a saved route whose From/To exactly matches the trip (case-insensitive).
+function findSavedRouteForTrip(trip) {
+  const f = String(trip.from || '').trim().toUpperCase();
+  const to = String(trip.to || '').trim().toUpperCase();
+  if (!f || !to) return null;
+  return state.savedRoutes.find(r =>
+    String(r.from || '').trim().toUpperCase() === f &&
+    String(r.to || '').trim().toUpperCase() === to) || null;
+}
+
 function buildTripInputs() {
+  // Preserve any entries the user already filled in — keyed by trip identity — so
+  // navigating back/forward doesn't wipe per-trip edits. New trips get defaults;
+  // removed trips drop out.
+  const prev = {};
+  for (const ti of state.tripInputs || []) prev[tripKey(ti.trip)] = ti;
+
   state.tripInputs = state.trips.filter(t => !t.removed).map(trip => {
-    const vehicleType = state.vehicleTypes[trip.vehicle] || 'Truck';
-    const suggestedRate = findRouteRate(trip.from, trip.to, trip.item) || CONFIG.fixedRateDefault;
-    const snappedRate = Math.max(CONFIG.fixedRateMin, Math.min(CONFIG.fixedRateMax,
-      Math.round(suggestedRate / CONFIG.fixedRateStep) * CONFIG.fixedRateStep));
+    const existing = prev[tripKey(trip)];
+    if (existing) { existing.trip = trip; return existing; }
+
+    // Precedence: manual override (localStorage) → wheel-count class (All Vehicle sheet) → Truck.
+    const vehicleType = state.vehicleTypes[trip.vehicle]
+      || state.vehicleClass[String(trip.vehicle).trim().toUpperCase()]
+      || 'Truck';
+    // Auto-fill from a saved route if From/To matches; else snap the default rate.
+    const matched = findSavedRouteForTrip(trip);
+    let chosenRouteName = '';
+    let fixedRate;
+    if (matched) {
+      chosenRouteName = matched.name;
+      fixedRate = vehicleType === 'Trailer' ? matched.trailerRate : matched.truckRate;
+    } else {
+      const suggestedRate = findRouteRate(trip.from, trip.to, trip.item) || CONFIG.fixedRateDefault;
+      fixedRate = Math.max(CONFIG.fixedRateMin, Math.min(CONFIG.fixedRateMax,
+        Math.round(suggestedRate / CONFIG.fixedRateStep) * CONFIG.fixedRateStep));
+    }
     const repairs = fetchRepairsForVehicle(trip.vehicle).map(r => ({ ...r, billAvailable: false }));
     return {
       trip,
       vehicleType,                // 'Truck' | 'Trailer' — sticky per vehicle via localStorage
-      chosenRouteName: '',        // user-picked saved route (overrides snappedRate)
-      fixedRate: snappedRate,
+      chosenRouteName,            // auto-selected saved route (or user-picked later)
+      fixedRate,
       includeLoadUnload: false,
       loadUnloadAmount: 0,
       haltDays: 0,
@@ -1171,11 +1257,8 @@ function renderTripLoop() {
 }
 
 function renderTripCard(ti, idx) {
-  const calc = calcTripSettlement(ti);
   const flags = detectAnomalies(ti.trip);
   const flagHtml = flags.length ? `<div class="warn-box"><strong>Flags:</strong> ${flags.join(' · ')}</div>` : '';
-  const errs = validateTripInput(ti);
-  const errHtml = errs.length ? `<div class="err-box">${errs.join('<br>')}</div>` : '';
   const repairsHtml = ti.repairs.length === 0 ? '<div class="muted">No repair entries on file for this vehicle in the period.</div>' :
     ti.repairs.map((r, ri) => `
       <div class="check-row">
@@ -1228,7 +1311,7 @@ function renderTripCard(ti, idx) {
         <div>
           <label>
             <input type="checkbox" data-field="includeLoadUnload" data-idx="${idx}" ${ti.includeLoadUnload ? 'checked' : ''} />
-            Include Loading/Unloading
+            Add expenses
           </label>
           <input type="number" min="0" value="${ti.loadUnloadAmount}" data-field="loadUnloadAmount" data-idx="${idx}" placeholder="Amount" ${ti.includeLoadUnload ? '' : 'disabled'} />
         </div>
@@ -1243,24 +1326,49 @@ function renderTripCard(ti, idx) {
       </div>
       <h3 style="margin-top:14px">Repairs (only if bill available)</h3>
       ${repairsHtml}
-      ${errHtml}
+      <div id="trip-sum-${idx}">${tripSummaryInner(ti)}</div>
+    </div>
+  `;
+}
+
+// Computed output (validation + settlement breakdown) for one trip card.
+// Kept separate so live-typing can refresh just this block without rebuilding
+// the input fields (which would steal focus).
+function tripSummaryInner(ti) {
+  const calc = calcTripSettlement(ti);
+  const errs = validateTripInput(ti);
+  const errHtml = errs.length ? `<div class="err-box">${errs.join('<br>')}</div>` : '';
+  return `${errHtml}
       <div class="summary-grid" style="margin-top:14px">
         <div class="label">Fixed</div><div class="value">${fmt(ti.fixedRate)}</div>
-        <div class="label">Loading/Unloading</div><div class="value">${fmt(calc.loadUnload)}</div>
+        <div class="label">Expenses</div><div class="value">${fmt(calc.loadUnload)}</div>
         <div class="label">Repairs (with bill)</div><div class="value">${fmt(calc.repairsTotal)}</div>
         <div class="label">Halt (${ti.haltDays} × ${fmt(ti.haltRate)})</div><div class="value">${fmt(calc.haltTotal)}</div>
         <div class="label">Trip type</div><div class="value">${ti.tripType}${ti.tripType === 'Partial' ? ' ' + ti.partialPct + '%' : ''}</div>
         <div class="label total">Trip Settlement</div><div class="value total">${fmt(calc.settlement)}</div>
-      </div>
-    </div>
-  `;
+      </div>`;
+}
+
+function refreshTripSummary(idx) {
+  const el = $('trip-sum-' + idx);
+  if (el) el.innerHTML = tripSummaryInner(state.tripInputs[idx]);
 }
 
 function attachTripCardListeners(idx) {
   document.querySelectorAll(`#trip-card-${idx} [data-field]`).forEach(el => {
     el.addEventListener('change', updateTripField);
-    if (el.type === 'number' || el.type === 'text') el.addEventListener('input', updateTripField);
+    // While typing in a number/text field, update only the summary (not the inputs)
+    // so the caret stays put. The full re-render still runs on 'change' (blur/commit).
+    if (el.type === 'number' || el.type === 'text') el.addEventListener('input', updateTripFieldLive);
   });
+}
+
+function updateTripFieldLive(e) {
+  const idx = parseInt(e.target.dataset.idx);
+  const field = e.target.dataset.field;
+  const ti = state.tripInputs[idx];
+  ti[field] = e.target.type === 'number' ? Number(e.target.value) : e.target.value;
+  refreshTripSummary(idx);
 }
 
 function updateTripField(e) {
