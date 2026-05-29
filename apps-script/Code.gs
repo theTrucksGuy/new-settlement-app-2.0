@@ -136,7 +136,9 @@ function readTab_(which) {
   const data = sh.getDataRange().getValues();
   const hdr = HEADER_ROW[which] || 1;      // 1-based header row (skips banner rows)
   if (data.length < hdr + 1) return [];
-  const tz = Session.getScriptTimeZone();
+  // Format dates in the SPREADSHEET's timezone (not the script's) so a date cell
+  // doesn't shift a day when the Apps Script project tz differs from the sheet's.
+  const tz = (ss.getSpreadsheetTimeZone && ss.getSpreadsheetTimeZone()) || Session.getScriptTimeZone();
   const headers = data[hdr - 1].map(h => String(h).trim());
   const out = [];
   for (let i = hdr; i < data.length; i++) {
