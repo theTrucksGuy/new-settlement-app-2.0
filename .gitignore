@@ -1,0 +1,9 @@
+# Firebase service-account key — NEVER commit
+service-account.json
+
+# Node deps if any (firebase-admin for provisioning)
+node_modules/
+
+# Local OS noise
+.DS_Store
+Thumbs.db

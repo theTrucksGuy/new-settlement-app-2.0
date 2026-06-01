@@ -7,6 +7,10 @@
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jspdf-autotable@3.6.0/dist/jspdf.plugin.autotable.min.js"></script>
+<!-- Firebase (compat) for vanilla JS — auth + firestore -->
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
 <style>
   :root {
     --bg: #0f1115;
@@ -117,6 +121,7 @@
   <div class="meta">v1.0 &nbsp;·&nbsp; <span id="today-date"></span>
     &nbsp;·&nbsp; <button class="secondary small" id="open-routes-btn" type="button" style="margin-left:6px">📋 Routes</button>
     &nbsp;<button class="secondary small" id="open-records-btn" type="button">🧾 Records</button>
+    &nbsp;·&nbsp; <span id="user-info" class="muted"></span>
   </div>
 </header>
 
@@ -147,6 +152,21 @@
     </div>
     <h3 style="margin-top:18px">Saved routes</h3>
     <div id="saved-routes-list"></div>
+  </div>
+</div>
+
+<!-- Login overlay — blocks the app until the user is signed in -->
+<div id="login-overlay" style="display:none;position:fixed;inset:0;background:#0c0c0c;z-index:300;align-items:center;justify-content:center;padding:24px">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;width:min(380px,100%);padding:24px;box-shadow:0 20px 60px rgba(0,0,0,0.4)">
+    <h2 style="margin:0 0 4px">🔐 Sign in</h2>
+    <p class="muted" style="margin:0 0 16px">GRUBUS Settlement Engine</p>
+    <div id="login-config-warning" class="warn-box" style="display:none">Firebase config is missing. Paste your project's <code>FIREBASE_CONFIG</code> at the top of the &lt;script&gt; block and reload.</div>
+    <form id="login-form" onsubmit="return false">
+      <div style="margin-bottom:10px"><label>Email</label><input type="email" id="login-email" autocomplete="username" required></div>
+      <div style="margin-bottom:10px"><label>Password</label><input type="password" id="login-password" autocomplete="current-password" required></div>
+      <div id="login-error" class="err-box" style="display:none"></div>
+      <button id="login-btn" type="submit" style="width:100%">Sign in</button>
+    </form>
   </div>
 </div>
 
@@ -364,13 +384,13 @@
     <div id="summary-warning"></div>
     <div class="actions between">
       <button class="secondary" onclick="goStep(6)">&larr; Back</button>
-      <button id="finalize-btn">Confirm &amp; Finalize</button>
+      <button id="finalize-btn">Submit settlement</button>
     </div>
   </section>
 
   <!-- Step 8: Done -->
   <section class="card" id="step-8">
-    <h2>Settlement Finalized &nbsp;<span class="badge ok">DONE</span></h2>
+    <h2>Settlement Submitted &nbsp;<span class="badge ok">SUBMITTED</span></h2>
     <div id="done-output"></div>
     <div class="toolbar" style="margin-top:18px">
       <button onclick="downloadPdf()">Download PDF Statement</button>
@@ -387,11 +407,48 @@
    Implements spec sections 1-13
 ============================================================ */
 
+// ▼▼ PASTE your NEW Firebase project's config here (Console → Project Settings → Your apps → SDK config).
+//    Leave blank until you've created the project — the app will show a clear notice.
+const FIREBASE_CONFIG = {
+  apiKey: 'AIzaSyAajiABVinp9o-u_nxGF7mI8k31K7In5yQ',
+  authDomain: 'driver-settlement-79646.firebaseapp.com',
+  projectId: 'driver-settlement-79646',
+  storageBucket: 'driver-settlement-79646.firebasestorage.app',
+  messagingSenderId: '809887737495',
+  appId: '1:809887737495:web:6eddbe5c285b841dfdebd2',
+};
+// ▲▲
+
+let fbApp = null, fbAuth = null, fbDb = null;
+const FIREBASE_READY = !!FIREBASE_CONFIG.apiKey;
+if (FIREBASE_READY) {
+  try {
+    fbApp = firebase.initializeApp(FIREBASE_CONFIG);
+    fbAuth = firebase.auth();
+    fbDb = firebase.firestore();
+  } catch (err) {
+    console.error('Firebase init failed:', err);
+  }
+}
+
+// Current authenticated user + role profile. Set after successful sign-in.
+const currentUser = { uid: null, email: null, name: null, role: null };
+
+// Role hierarchy: admin ⊇ manager ⊇ basic.
+function hasRole(needed) {
+  const order = { basic: 1, manager: 2, admin: 3 };
+  return (order[currentUser.role] || 0) >= (order[needed] || 0);
+}
+function isAdmin()   { return currentUser.role === 'admin'; }
+function isManager() { return hasRole('manager'); }
+function isBasic()   { return hasRole('basic'); }
+
 const STORAGE = {
   driverLog: 'grubus_driver_settlement_log',
   driverSummary: 'grubus_driver_settlement_summary',
   truckLog: 'grubus_truck_settlement_log',
   settlementAdvances: 'grubus_settlement_advances',
+  editLog: 'grubus_settlement_edit_log',
   settledIndex: 'grubus_settled_trips_index',
   driverLastSettlement: 'grubus_driver_last_settlement',
   proxyUrl: 'grubus_proxy_url',
@@ -413,6 +470,7 @@ const CONFIG = {
 
 const state = {
   currentStep: 0,        // active wizard step (for top Prev/Next nav)
+  records: { list: [], opened: null, openedEditLog: [] },   // Firestore cache for the Records modal
   mode: null,            // 'sheets' | 'xlsx'
   proxyUrl: '',
   historyConfigured: false,  // true only when Apps Script has historySheetId set
@@ -534,80 +592,319 @@ $('routes-overlay').addEventListener('click', (e) => { if (e.target.id === 'rout
 $('open-records-btn').addEventListener('click', openRecordsModal);
 $('records-overlay').addEventListener('click', (e) => { if (e.target.id === 'records-overlay') closeRecordsModal(); });
 
-// ---------- Settlement records (local, downloadable anytime) ----------
-function renderRecordsList() {
+// ---------- Settlement records: list → open → edit → verify → pay ----------
+function statusBadge(s) {
+  const col = { Submitted: '#F5C518', Verified: '#4DA3FF', Paid: '#22C55E' }[s] || '#888';
+  return `<span class="badge" style="background:${col}22;color:${col};border:1px solid ${col}">${escapeHtmlSimple(s || 'Submitted')}</span>`;
+}
+
+async function renderRecordsList() {
   const c = $('records-list');
-  const rows = loadStore(STORAGE.driverSummary, []);
-  const trips = loadStore(STORAGE.driverLog, []);
-  const advances = loadStore(STORAGE.settlementAdvances, []);
-  if (!rows.length) { c.innerHTML = '<div class="muted">No settlements recorded yet.</div>'; return; }
-  let html = '';
-  rows.slice().reverse().forEach(r => {
-    const sid = r['Settlement ID'];
-    const sTrips = trips.filter(t => t['Settlement ID'] === sid);
-    const sAdv = advances.filter(a => a['Settlement ID'] === sid);
-    html += `<div class="trip-card" style="margin-bottom:12px">
-      <h4 style="margin:0 0 6px">${escapeHtmlSimple(sid || '')} <span class="muted">· ${escapeHtmlSimple(r['Date'] || '')}</span></h4>
-      <div class="grid-3" style="font-size:13px;gap:8px">
-        <div><span class="muted">Driver:</span> ${escapeHtmlSimple((r['Driver Name'] || '') + ' (' + (r['Driver ID'] || '') + ')')}</div>
-        <div><span class="muted">Period:</span> ${escapeHtmlSimple((r['Period From'] || '') + ' → ' + (r['Period To'] || ''))}</div>
-        <div><span class="muted">Trips:</span> ${r['Trip Count'] != null ? r['Trip Count'] : '—'}</div>
-      </div>
-      <div class="summary-grid" style="margin-top:8px">
-        <div class="label">Gross</div><div class="value num">${fmt(Number(r['Gross']) || 0)}</div>
-        <div class="label">Incentive</div><div class="value num">+ ${fmt(Number(r['Incentive']) || 0)}${r['Incentive Reason'] ? ` <span class="muted">(${escapeHtmlSimple(r['Incentive Reason'])})</span>` : ''}</div>
-        <div class="label">Penalty</div><div class="value num">− ${fmt(Number(r['Penalty']) || 0)}${r['Penalty Reason'] ? ` <span class="muted">(${escapeHtmlSimple(r['Penalty Reason'])})</span>` : ''}</div>
-        <div class="label">Cash / UPI / Account advances</div><div class="value num">− ${fmt(Number(r['Cash Advances']) || 0)} / ${fmt(Number(r['UPI Advances']) || 0)} / ${fmt(Number(r['Account Advances']) || 0)}</div>
-        <div class="label total">Net Payable</div><div class="value total num">${fmt(Number(r['Net Payable']) || 0)}</div>
-      </div>
-      ${sTrips.length ? `<details style="margin-top:8px"><summary class="muted" style="cursor:pointer">${sTrips.length} trip(s) — full breakdown</summary>
-        <table style="margin-top:6px"><thead><tr><th>Trip No</th><th>Date</th><th>Vehicle</th><th>Route</th><th class="right">Fixed</th><th class="right">Halt</th><th class="right">L/UL</th><th class="right">Repairs</th><th class="right">Toll</th><th class="right">Road</th><th class="right">Others</th><th class="right">Settlement</th></tr></thead><tbody>
-        ${sTrips.map(t => `<tr>
-          <td>${escapeHtmlSimple(t['Trip No'] || '')}</td><td>${escapeHtmlSimple(t['Trip Date'] || '')}</td>
-          <td>${escapeHtmlSimple(t['Vehicle'] || '')}</td><td>${escapeHtmlSimple(t['Route'] || '')}</td>
-          <td class="right num">${fmtNum(Number(t['Fixed Rate']) || 0)}</td><td class="right num">${fmtNum(Number(t['Halt Total']) || 0)}</td>
-          <td class="right num">${fmtNum(Number(t['Exp Loading/Unloading']) || 0)}</td><td class="right num">${fmtNum(Number(t['Exp Repairs']) || 0)}</td>
-          <td class="right num">${fmtNum(Number(t['Exp Toll']) || 0)}</td><td class="right num">${fmtNum(Number(t['Exp Road']) || 0)}</td>
-          <td class="right num">${fmtNum(Number(t['Exp Others']) || 0)}</td><td class="right num">${fmtNum(Number(t['Trip Settlement']) || 0)}</td>
-        </tr>`).join('')}
-        </tbody></table></details>` : ''}
-      ${sAdv.length ? `<details style="margin-top:6px"><summary class="muted" style="cursor:pointer">${sAdv.length} advance(s) deducted/recorded</summary>
-        <table style="margin-top:6px"><thead><tr><th>Date</th><th>Mode</th><th>Type</th><th class="right">Amount</th><th>Deducted</th></tr></thead><tbody>
-        ${sAdv.map(a => `<tr><td>${escapeHtmlSimple(a['Advance Date'] || '')}</td><td>${escapeHtmlSimple(a['Mode'] || '')}</td><td>${escapeHtmlSimple(a['Type'] || '')}</td><td class="right num">${fmtNum(Number(a['Amount']) || 0)}</td><td>${escapeHtmlSimple(a['Deducted'] || '')}</td></tr>`).join('')}
-        </tbody></table></details>` : ''}
-    </div>`;
+  c.innerHTML = '<div class="muted">Loading…</div>';
+  if (!FIREBASE_READY || !currentUser.uid) {
+    c.innerHTML = '<div class="warn-box">Sign in to view settlement records.</div>'; return;
+  }
+  let rows = [];
+  try {
+    const snap = await fbDb.collection('settlements').orderBy('Date', 'desc').limit(500).get();
+    rows = snap.docs.map(d => Object.assign({ _id: d.id }, d.data()));
+  } catch (err) {
+    c.innerHTML = '<div class="err-box">Failed to load: ' + escapeHtmlSimple(err.message || String(err)) + '</div>'; return;
+  }
+  state.records.list = rows;
+  if (!rows.length) { c.innerHTML = '<div class="muted">No settlements yet.</div>'; return; }
+  let html = '<table><thead><tr><th>Settlement ID</th><th>Date</th><th>Driver</th><th class="right">Net &#8377;</th><th>Status</th><th></th></tr></thead><tbody>';
+  rows.forEach(r => {
+    const sid = r._id;
+    html += `<tr>
+      <td>${escapeHtmlSimple(sid || '')}</td>
+      <td>${escapeHtmlSimple(r['Date'] || '')}</td>
+      <td>${escapeHtmlSimple((r['Driver Name'] || '') + ' (' + (r['Driver ID'] || '') + ')')}</td>
+      <td class="right num">${fmt(Number(r['Net Payable']) || 0)}</td>
+      <td>${statusBadge(r['Status'])}</td>
+      <td><button class="secondary small" type="button" onclick="openRecord('${sid}')">Open</button></td>
+    </tr>`;
   });
+  html += '</tbody></table>';
   c.innerHTML = html;
+}
+
+async function openRecord(id) {
+  const c = $('records-list');
+  c.innerHTML = '<div class="muted">Loading…</div>';
+  try {
+    const docSnap = await fbDb.collection('settlements').doc(id).get();
+    if (!docSnap.exists) { renderRecordsList(); return; }
+    state.records.opened = Object.assign({ _id: id }, docSnap.data());
+    const logSnap = await fbDb.collection('settlements').doc(id).collection('editLog').orderBy('timestamp', 'desc').get();
+    state.records.openedEditLog = logSnap.docs.map(d => Object.assign({ _id: d.id }, d.data()));
+  } catch (err) {
+    c.innerHTML = '<div class="err-box">Failed: ' + escapeHtmlSimple(err.message || String(err)) + '</div>'; return;
+  }
+  renderOpenedRecord();
+}
+
+function renderOpenedRecord() {
+  const c = $('records-list');
+  const s = state.records.opened;
+  if (!s) { renderRecordsList(); return; }
+  const id = s._id;
+  const trips = s.trips || [];
+  const advs = s.advances || [];
+  const edits = state.records.openedEditLog || [];
+  const status = s['Status'] || 'Submitted';
+  const locked = status === 'Paid';
+  const canEdit = !locked && isManager();
+  const canVerify = !locked && isManager() && status === 'Submitted';
+  const canPay = !locked && isAdmin() && status === 'Verified';
+  const ro = canEdit ? '' : 'disabled';
+  const num = v => Number(v) || 0;
+  const ef = (i, field, label) => `<div><label>${label}</label><input type="number" min="0" data-kind="trip" data-i="${i}" data-field="${field}" value="${num(trips[i][field])}" ${ro}></div>`;
+
+  const tripsHtml = trips.map((t, i) => `
+    <div class="trip-card" style="margin:6px 0">
+      <h4 style="margin:0 0 4px">${escapeHtmlSimple(t['Trip No'] || '')} <span class="muted">· ${escapeHtmlSimple(t['Trip Date'] || '')} · ${escapeHtmlSimple(t['Vehicle'] || '')} · ${escapeHtmlSimple(t['Route'] || '')}</span></h4>
+      <div class="grid-3" style="font-size:12px">
+        ${ef(i, 'Fixed Rate', 'Fixed Rate')}
+        ${ef(i, 'Halt Days', 'Halt Days')}
+        ${ef(i, 'Halt Rate', 'Halt Rate')}
+        ${ef(i, 'Exp Loading/Unloading', 'Loading/Unloading')}
+        ${ef(i, 'Exp Repairs', 'Repairs')}
+        ${ef(i, 'Exp Toll', 'Toll+Mech')}
+        ${ef(i, 'Exp Road', 'Road (RTO/Police)')}
+        ${ef(i, 'Exp Others', 'Others')}
+        <div><label class="muted">Trip Settlement</label><div class="num" style="padding-top:6px;font-weight:600">${fmt(num(t['Trip Settlement']))}</div></div>
+      </div>
+    </div>`).join('');
+
+  const advHtml = advs.length ? `<table><thead><tr><th>Date</th><th>Mode</th><th>Type</th><th class="right">Amount</th><th>Deducted</th></tr></thead><tbody>
+      ${advs.map((a, i) => `<tr>
+        <td>${escapeHtmlSimple(a['Advance Date'] || '')}</td><td>${escapeHtmlSimple(a['Mode'] || '')}</td><td>${escapeHtmlSimple(a['Type'] || '')}</td>
+        <td class="right"><input type="number" min="0" style="width:110px" data-kind="adv" data-i="${i}" data-field="Amount" value="${num(a['Amount'])}" ${ro}></td>
+        <td><input type="checkbox" data-kind="adv" data-i="${i}" data-field="Deducted" ${a['Deducted'] === 'Yes' ? 'checked' : ''} ${ro}></td>
+      </tr>`).join('')}</tbody></table>` : '<div class="muted">No advances on this settlement.</div>';
+
+  const editHtml = edits.length ? `<table><thead><tr><th>When</th><th>By</th><th>Field</th><th>Old &rarr; New</th></tr></thead><tbody>
+      ${edits.map(e => `<tr><td>${escapeHtmlSimple(e.timestamp || '')}</td><td>${escapeHtmlSimple(e.editedBy || '')}</td><td>${escapeHtmlSimple((e.scope && e.scope !== 'summary' ? e.scope + ': ' : '') + (e.field || ''))}</td><td>${escapeHtmlSimple(String(e.oldValue) + ' → ' + String(e.newValue))}</td></tr>`).join('')}
+      </tbody></table>` : '<div class="muted">No edits yet.</div>';
+
+  const btns = [];
+  if (canEdit)   btns.push(`<button class="secondary small" type="button" onclick="applyRecordEdits('${id}')">💾 Save changes</button>`);
+  if (canVerify) btns.push(`<button class="secondary small" type="button" onclick="markVerified('${id}')">✓ Mark Verified</button>`);
+  if (canPay)    btns.push(`<button class="small" type="button" onclick="finaliseAndPay('${id}')">🔒 Finalise &amp; Pay</button>`);
+  btns.push(`<button class="secondary small" type="button" onclick="downloadRecordPdf('${id}')">⬇ Download PDF</button>`);
+  const actions = btns.join(' ');
+
+  c.innerHTML = `
+    <button class="secondary small" type="button" onclick="renderRecordsList()">&larr; Back to list</button>
+    <div style="display:flex;align-items:center;gap:10px;margin:10px 0 4px"><h3 style="margin:0">${escapeHtmlSimple(id)}</h3> ${statusBadge(status)} ${s['Payment Date'] ? `<span class="muted">Paid ${escapeHtmlSimple(s['Payment Date'])}</span>` : ''} ${locked ? '<span class="muted">— locked</span>' : ''}</div>
+    <div class="grid-3" style="font-size:13px">
+      <div><span class="muted">Driver:</span> ${escapeHtmlSimple((s['Driver Name'] || '') + ' (' + (s['Driver ID'] || '') + ')')}</div>
+      <div><span class="muted">Period:</span> ${escapeHtmlSimple((s['Period From'] || '') + ' → ' + (s['Period To'] || ''))}</div>
+      <div><span class="muted">Date:</span> ${escapeHtmlSimple(s['Date'] || '')}</div>
+    </div>
+    <h3 style="margin-top:12px">Trips (${trips.length})</h3>
+    ${tripsHtml}
+    <h3 style="margin-top:12px">Advances</h3>
+    ${advHtml}
+    <h3 style="margin-top:12px">Adjustments</h3>
+    <div class="grid-3" style="font-size:12px">
+      <div><label>Incentive (+)</label><input type="number" min="0" id="er-incentive" value="${num(s['Incentive'])}" ${ro}></div>
+      <div><label>Incentive reason</label><input type="text" id="er-incentive-reason" value="${escapeHtmlSimple(s['Incentive Reason'] || '')}" ${ro}></div>
+      <div><label>Penalty (−)</label><input type="number" min="0" id="er-penalty" value="${num(s['Penalty'])}" ${ro}></div>
+      <div><label>Penalty reason</label><input type="text" id="er-penalty-reason" value="${escapeHtmlSimple(s['Penalty Reason'] || '')}" ${ro}></div>
+    </div>
+    <div class="summary-grid" style="margin-top:10px">
+      <div class="label">Gross</div><div class="value num">${fmt(num(s['Gross']))}</div>
+      <div class="label">Cash / UPI / Account advances</div><div class="value num">− ${fmt(num(s['Cash Advances']))} / ${fmt(num(s['UPI Advances']))} / ${fmt(num(s['Account Advances']))}</div>
+      <div class="label total">Net Payable</div><div class="value total num">${fmt(num(s['Net Payable']))}</div>
+    </div>
+    <div class="actions" style="justify-content:flex-start;margin-top:12px;flex-wrap:wrap;gap:8px">${actions}</div>
+    <h3 style="margin-top:14px">Edit Log <span class="muted" style="font-weight:normal">(read-only audit trail)</span></h3>
+    ${editHtml}
+  `;
+}
+
+// In-place recompute over a settlement doc (Firestore shape). Mutates and returns it.
+function recomputeSettlementDoc(s) {
+  const num = v => Number(v) || 0;
+  let gross = 0;
+  (s.trips || []).forEach(t => {
+    const haltTotal = num(t['Halt Days']) * num(t['Halt Rate']);
+    const expTotal = num(t['Exp Loading/Unloading']) + num(t['Exp Repairs']) + num(t['Exp Toll']) + num(t['Exp Road']) + num(t['Exp Others']);
+    const pct = num(t['Trip %']) || 100;
+    const settlement = Math.round(num(t['Fixed Rate']) * pct / 100 + haltTotal + expTotal);
+    t['Halt Total'] = haltTotal; t['Expenses Total'] = expTotal; t['Trip Settlement'] = settlement;
+    gross += settlement;
+  });
+  let cash = 0, upi = 0, acct = 0;
+  (s.advances || []).forEach(a => {
+    if (a['Deducted'] !== 'Yes') return;
+    const amt = num(a['Amount']);
+    if (a['Mode'] === 'Cash') cash += amt; else if (a['Mode'] === 'UPI') upi += amt; else acct += amt;
+  });
+  s['Gross'] = gross; s['Cash Advances'] = cash; s['UPI Advances'] = upi; s['Account Advances'] = acct;
+  s['Net Payable'] = gross + num(s['Incentive']) - num(s['Penalty']) - cash - upi - acct;
+  return s;
+}
+
+async function applyRecordEdits(id) {
+  if (!isManager()) { alert('Only managers and admins can edit records.'); return; }
+  const s = state.records.opened;
+  if (!s || s._id !== id) { alert('Record not loaded.'); return; }
+  if ((s['Status'] || 'Submitted') === 'Paid') { alert('This settlement is Paid and locked.'); return; }
+  const editedBy = currentUser.name || currentUser.email || '';
+  const editedByUid = currentUser.uid;
+  const ts = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const newEdits = [];
+  const log = (scope, field, oldV, newV) => {
+    if (String(oldV) !== String(newV)) newEdits.push({ timestamp: ts, editedBy, editedByUid, scope, field, oldValue: oldV, newValue: newV });
+  };
+  // Work on copies so the cached doc isn't mutated until the save succeeds.
+  const trips = (s.trips || []).map(t => Object.assign({}, t));
+  const advs = (s.advances || []).map(a => Object.assign({}, a));
+
+  document.querySelectorAll('#records-list [data-kind="trip"]').forEach(el => {
+    const i = Number(el.dataset.i), field = el.dataset.field;
+    const row = trips[i]; if (!row) return;
+    const oldV = Number(row[field]) || 0, newV = Number(el.value) || 0;
+    if (oldV !== newV) { log(row['Trip No'] || ('Trip ' + (i + 1)), field, oldV, newV); row[field] = newV; }
+  });
+  document.querySelectorAll('#records-list [data-kind="adv"]').forEach(el => {
+    const i = Number(el.dataset.i), field = el.dataset.field;
+    const row = advs[i]; if (!row) return;
+    if (field === 'Amount') {
+      const o = Number(row['Amount']) || 0, n = Number(el.value) || 0;
+      if (o !== n) { log('Advance ' + (i + 1), 'Amount', o, n); row['Amount'] = n; }
+    } else {
+      const o = row['Deducted'] || 'No', n = el.checked ? 'Yes' : 'No';
+      if (o !== n) { log('Advance ' + (i + 1), 'Deducted', o, n); row['Deducted'] = n; }
+    }
+  });
+  const inc = Number($('er-incentive').value) || 0, incR = ($('er-incentive-reason').value || '').trim();
+  const pen = Number($('er-penalty').value) || 0, penR = ($('er-penalty-reason').value || '').trim();
+  log('summary', 'Incentive', Number(s['Incentive']) || 0, inc);
+  log('summary', 'Incentive Reason', s['Incentive Reason'] || '', incR);
+  log('summary', 'Penalty', Number(s['Penalty']) || 0, pen);
+  log('summary', 'Penalty Reason', s['Penalty Reason'] || '', penR);
+
+  if (!newEdits.length) { alert('No changes to save.'); return; }
+
+  const updated = Object.assign({}, s, {
+    trips, advances: advs, Incentive: inc, 'Incentive Reason': incR,
+    Penalty: pen, 'Penalty Reason': penR, 'Last Edited': ts,
+  });
+  delete updated._id;
+  recomputeSettlementDoc(updated);
+
+  try {
+    const batch = fbDb.batch();
+    const ref = fbDb.collection('settlements').doc(id);
+    batch.update(ref, updated);
+    newEdits.forEach(e => batch.set(ref.collection('editLog').doc(), e));
+    await batch.commit();
+  } catch (err) {
+    alert('Save failed: ' + (err.message || err)); return;
+  }
+  await openRecord(id);
+  alert(newEdits.length + ' change(s) saved and logged.');
+}
+
+async function markVerified(id) {
+  if (!isManager()) { alert('Only managers and admins can verify.'); return; }
+  try {
+    await fbDb.collection('settlements').doc(id).update({ Status: 'Verified' });
+  } catch (err) { alert('Verify failed: ' + (err.message || err)); return; }
+  await openRecord(id);
+}
+
+async function finaliseAndPay(id) {
+  if (!isAdmin()) { alert('Only admins can finalise & pay.'); return; }
+  const s = state.records.opened;
+  if (!s || s._id !== id) { alert('Record not loaded.'); return; }
+  if (s['Status'] !== 'Verified') { alert('Mark the settlement Verified before finalising.'); return; }
+  const pd = (prompt('Final payment date (YYYY-MM-DD):', today()) || '').trim();
+  if (!pd) return;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(pd)) { alert('Enter the date as YYYY-MM-DD.'); return; }
+  if (!confirm('Finalise and mark PAID? This locks the settlement — no further edits.')) return;
+  try {
+    await fbDb.collection('settlements').doc(id).update({ Status: 'Paid', 'Payment Date': pd, 'Finalised On': today() });
+  } catch (err) { alert('Finalise failed: ' + (err.message || err)); return; }
+  await openRecord(id);
+  renderSettlementPdf(bundleFromStored(id));
+}
+
+function downloadRecordPdf(id) {
+  if (!state.records.opened || state.records.opened._id !== id) {
+    openRecord(id).then(() => renderSettlementPdf(bundleFromStored(id)));
+    return;
+  }
+  renderSettlementPdf(bundleFromStored(id));
 }
 function openRecordsModal() { $('records-overlay').style.display = 'flex'; renderRecordsList(); }
 function closeRecordsModal() { $('records-overlay').style.display = 'none'; }
-function clearRecords() {
-  if (!confirm('Clear ALL settlement records (summaries, trip details, advances, truck log, settled-trips index)? This cannot be undone.')) return;
-  [STORAGE.driverLog, STORAGE.driverSummary, STORAGE.truckLog, STORAGE.settlementAdvances, STORAGE.settledIndex, STORAGE.driverLastSettlement]
-    .forEach(k => localStorage.removeItem(k));
-  state.settledIndex = {};
-  refreshStorageStats();
-  renderRecordsList();
-  alert('Records cleared.');
+
+async function clearRecords() {
+  if (!isAdmin()) { alert('Only admins can clear records.'); return; }
+  if (!confirm('Permanently delete ALL settlements (including edit logs)? This cannot be undone.')) return;
+  try {
+    const snap = await fbDb.collection('settlements').get();
+    for (const docu of snap.docs) {
+      const logSnap = await docu.ref.collection('editLog').get();
+      const batch = fbDb.batch();
+      logSnap.docs.forEach(l => batch.delete(l.ref));
+      batch.delete(docu.ref);
+      await batch.commit();
+    }
+    state.records = { list: [], opened: null, openedEditLog: [] };
+    renderRecordsList();
+    alert('All records cleared.');
+  } catch (err) {
+    alert('Clear failed: ' + (err.message || err));
+  }
 }
-// Full multi-sheet export — every detail of every settlement done on the platform.
-function exportAllRecords() {
-  const summary = loadStore(STORAGE.driverSummary, []);
-  const trips = loadStore(STORAGE.driverLog, []);
-  const advances = loadStore(STORAGE.settlementAdvances, []);
-  const trucks = loadStore(STORAGE.truckLog, []);
-  if (!summary.length && !trips.length) { alert('No settlement records yet.'); return; }
-  const wb = XLSX.utils.book_new();
-  const add = (rows, name) => XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows.length ? rows : [{}]), name);
-  add(summary, 'Summary');
-  add(trips, 'Trip Details');
-  add(advances, 'Advances');
-  add(trucks, 'Truck Log');
-  XLSX.writeFile(wb, `GRUBUS_Settlement_Records_${today().replace(/-/g, '')}.xlsx`);
+
+function summaryOnly(s) {
+  const out = {}; const skip = new Set(['trips', 'advances', 'truckLog', 'createdAt', 'createdBy', 'createdByName', '_id']);
+  for (const k of Object.keys(s)) if (!skip.has(k)) out[k] = s[k];
+  return out;
+}
+async function exportAllRecords() {
+  if (!FIREBASE_READY || !currentUser.uid) { alert('Sign in first.'); return; }
+  try {
+    const snap = await fbDb.collection('settlements').orderBy('Date', 'desc').get();
+    const settlements = snap.docs.map(d => Object.assign({ _id: d.id }, d.data()));
+    if (!settlements.length) { alert('No settlement records yet.'); return; }
+    const summary = settlements.map(s => Object.assign({ 'Settlement ID': s._id }, summaryOnly(s)));
+    const trips = []; const advances = []; const trucks = []; const edits = [];
+    for (const s of settlements) {
+      (s.trips || []).forEach(t => trips.push(Object.assign({}, t)));
+      (s.advances || []).forEach(a => advances.push(Object.assign({ 'Settlement ID': s._id }, a)));
+      (s.truckLog || []).forEach(t => trucks.push(t));
+      const log = await fbDb.collection('settlements').doc(s._id).collection('editLog').orderBy('timestamp').get();
+      log.docs.forEach(d => edits.push(Object.assign({ 'Settlement ID': s._id }, d.data())));
+    }
+    const wb = XLSX.utils.book_new();
+    const add = (rows, name) => XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows.length ? rows : [{}]), name);
+    add(summary, 'Summary');
+    add(trips, 'Trip Details');
+    add(advances, 'Advances');
+    add(trucks, 'Truck Log');
+    add(edits, 'Edit Log');
+    XLSX.writeFile(wb, `GRUBUS_Settlement_Records_${today().replace(/-/g, '')}.xlsx`);
+  } catch (err) {
+    alert('Export failed: ' + (err.message || err));
+  }
 }
 window.closeRecordsModal = closeRecordsModal;
 window.clearRecords = clearRecords;
 window.exportAllRecords = exportAllRecords;
+window.openRecord = openRecord;
+window.renderRecordsList = renderRecordsList;
+window.applyRecordEdits = applyRecordEdits;
+window.markVerified = markVerified;
+window.finaliseAndPay = finaliseAndPay;
+window.downloadRecordPdf = downloadRecordPdf;
 
 function loadStore(k, fallback) {
   try { return JSON.parse(localStorage.getItem(k)) ?? fallback; } catch { return fallback; }
@@ -615,11 +912,9 @@ function loadStore(k, fallback) {
 function saveStore(k, v) { localStorage.setItem(k, JSON.stringify(v)); }
 
 function refreshStorageStats() {
-  const drv = loadStore(STORAGE.driverLog, []);
-  const sum = loadStore(STORAGE.driverSummary, []);
-  const trk = loadStore(STORAGE.truckLog, []);
-  const idx = loadStore(STORAGE.settledIndex, {});
-  $('storage-stats').textContent = `Stored: ${drv.length} driver-log rows · ${sum.length} settlements · ${trk.length} truck-log rows · ${Object.keys(idx).length} settled trips`;
+  // Records are in Firestore now; just show where they live.
+  const el = $('storage-stats');
+  if (el) el.textContent = 'Records: cloud (Firestore) — view via 🧾 Records';
 }
 refreshStorageStats();
 
@@ -654,6 +949,77 @@ function wireStepNav() {
   });
 }
 wireStepNav();
+
+// ---------- Auth (Firebase) + role gating ----------
+function showLogin(msg) {
+  const ov = $('login-overlay');
+  ov.style.display = 'flex';
+  if (!FIREBASE_READY) $('login-config-warning').style.display = 'block';
+  const er = $('login-error');
+  if (msg) { er.textContent = msg; er.style.display = 'block'; } else { er.style.display = 'none'; }
+}
+function hideLogin() { $('login-overlay').style.display = 'none'; }
+
+function applyRoleGating() {
+  const u = $('user-info');
+  if (u) u.innerHTML = currentUser.uid
+    ? `<strong>${escapeHtmlSimple(currentUser.name || '')}</strong> <span style="opacity:0.7">(${escapeHtmlSimple(currentUser.role || '')})</span> &nbsp;<button class="secondary small" type="button" onclick="signOutNow()">Sign out</button>`
+    : '';
+  document.body.classList.remove('role-basic', 'role-manager', 'role-admin');
+  if (currentUser.role) document.body.classList.add('role-' + currentUser.role);
+  // If the Records modal is open, re-render so the buttons reflect the role.
+  if ($('records-overlay').style.display === 'flex' && typeof renderRecordsList === 'function') {
+    try { renderRecordsList(); } catch (_) {}
+  }
+}
+
+function signOutNow() { if (fbAuth) fbAuth.signOut(); }
+window.signOutNow = signOutNow;
+
+$('login-form').addEventListener('submit', async () => {
+  if (!FIREBASE_READY) { showLogin('Firebase is not configured. See the FIREBASE_CONFIG block at the top of the script.'); return; }
+  const email = ($('login-email').value || '').trim();
+  const password = $('login-password').value;
+  const btn = $('login-btn');
+  $('login-error').style.display = 'none';
+  btn.disabled = true; const orig = btn.textContent; btn.textContent = 'Signing in…';
+  try {
+    await fbAuth.signInWithEmailAndPassword(email, password);
+  } catch (err) {
+    showLogin(err && err.message ? err.message : 'Sign-in failed.');
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
+  }
+});
+
+if (FIREBASE_READY) {
+  fbAuth.onAuthStateChanged(async (u) => {
+    if (!u) {
+      Object.assign(currentUser, { uid: null, email: null, name: null, role: null });
+      applyRoleGating();
+      showLogin();
+      return;
+    }
+    try {
+      const snap = await fbDb.collection('users').doc(u.uid).get();
+      if (!snap.exists) {
+        await fbAuth.signOut();
+        showLogin('No role assigned to this account. Ask the admin to provision your user.');
+        return;
+      }
+      const p = snap.data() || {};
+      Object.assign(currentUser, { uid: u.uid, email: u.email, name: p.name || u.email, role: p.role || 'basic' });
+      hideLogin();
+      applyRoleGating();
+    } catch (err) {
+      console.error('Profile load failed:', err);
+      showLogin('Failed to load profile: ' + (err.message || err));
+    }
+  });
+} else {
+  // Firebase not configured — show the login overlay with the config warning so it's obvious.
+  showLogin();
+}
 
 // ---------- Source tabs (Google Sheets vs XLSX) ----------
 document.querySelectorAll('#source-tabs .tab').forEach(tab => {
@@ -1356,10 +1722,10 @@ function calcTripSettlement(ti) {
   const expensesTotal = exp.loadUnload + exp.repairs + exp.toll + exp.road + exp.others;
   const haltTotal = (Number(ti.haltDays) || 0) * (Number(ti.haltRate) || 0);
   const factor = ti.tripType === 'Full' ? 1.0 : ((Number(ti.partialPct) || 0) / 100);
-  // Partial-pct applies ONLY to the fixed driver rate. Halt allowance is added in full;
-  // all five expense categories are DEDUCTED from the trip settlement.
+  // Partial-pct applies ONLY to the fixed driver rate. Halt allowance and all five
+  // expense categories are ADDED to the trip settlement (driver is reimbursed for them).
   const fixedPay = (Number(ti.fixedRate) || 0) * factor;
-  const settlement = Math.round(fixedPay + haltTotal - expensesTotal);
+  const settlement = Math.round(fixedPay + haltTotal + expensesTotal);
   return { exp, expensesTotal, haltTotal, fixedPay, settlement };
 }
 
@@ -1438,7 +1804,7 @@ function renderTripCard(ti, idx) {
         </div>
         <div></div>
       </div>
-      <h3 style="margin-top:14px">Expenses <span class="muted" style="font-weight:normal">(deducted from settlement)</span></h3>
+      <h3 style="margin-top:14px">Expenses <span class="muted" style="font-weight:normal">(added to settlement — reimbursed to driver)</span></h3>
       <div class="grid-3">
         <div>
           <label>Loading / Unloading</label>
@@ -1489,7 +1855,7 @@ function tripSummaryInner(ti) {
       <div class="summary-grid" style="margin-top:14px">
         <div class="label">Fixed (${ti.tripType === 'Full' ? '100%' : (ti.partialPct || 0) + '%'})</div><div class="value">${fmt(calc.fixedPay)}</div>
         <div class="label">Halt (${ti.haltDays || 0} × ${fmt(ti.haltRate || 0)})</div><div class="value">+ ${fmt(calc.haltTotal)}</div>
-        <div class="label">Expenses</div><div class="value">− ${fmt(calc.expensesTotal)}</div>
+        <div class="label">Expenses</div><div class="value">+ ${fmt(calc.expensesTotal)}</div>
         <div class="label total">Trip Settlement</div><div class="value total">${fmt(calc.settlement)}</div>
       </div>`;
 }
@@ -1576,10 +1942,9 @@ function renderSummary() {
   const net = gross + state.incentive - state.penalty - cashAdv - upiAdv - accountAdv;
   state.result = { gross, cashAdv, upiAdv, accountAdv, net, trips };
 
-  const willWriteToSheet = (state.mode === 'sheets' && state.historyConfigured);
-  const destBanner = willWriteToSheet
-    ? ''
-    : `<div class="warn-box"><strong>No History sheet linked.</strong> On Finalize, this settlement will be saved to <strong>browser local storage</strong> instead. Use the Export buttons on the next screen to download the Driver Log / Truck Log / PDF.</div>`;
+  const destBanner = FIREBASE_READY && currentUser.uid
+    ? `<div class="muted">Submitting saves this settlement to <strong>cloud Records</strong> (status: Submitted) and downloads the printable PDF. Verify &amp; payment happen from 🧾 Records.</div>`
+    : `<div class="err-box"><strong>You are not signed in.</strong> Sign in (reload if the login screen isn't showing) before submitting.</div>`;
   $('summary-header').innerHTML = `
     <div class="info"><strong>${state.driver.name}</strong> (${state.driver.id}) &nbsp;·&nbsp; Period ${state.periodFrom} → ${state.periodTo} &nbsp;·&nbsp; ${trips.length} trips</div>
     ${destBanner}
@@ -1612,11 +1977,11 @@ function renderSummary() {
           <div class="summary-grid" style="margin-top:10px">
             <div class="label">Fixed (${pctLabel})</div><div class="value num">${fmt(calc.fixedPay)}</div>
             <div class="label">Halt (${haltLabel})</div><div class="value num">+ ${fmt(calc.haltTotal)}</div>
-            <div class="label">Loading/Unloading</div><div class="value num">− ${fmt(calc.exp.loadUnload)}</div>
-            <div class="label">Repairs</div><div class="value num">− ${fmt(calc.exp.repairs)}</div>
-            <div class="label">Toll (toll+mechanical)</div><div class="value num">− ${fmt(calc.exp.toll)}</div>
-            <div class="label">Road (RTO/Police)</div><div class="value num">− ${fmt(calc.exp.road)}</div>
-            <div class="label">Others</div><div class="value num">− ${fmt(calc.exp.others)}</div>
+            <div class="label">Loading/Unloading</div><div class="value num">+ ${fmt(calc.exp.loadUnload)}</div>
+            <div class="label">Repairs</div><div class="value num">+ ${fmt(calc.exp.repairs)}</div>
+            <div class="label">Toll (toll+mechanical)</div><div class="value num">+ ${fmt(calc.exp.toll)}</div>
+            <div class="label">Road (RTO/Police)</div><div class="value num">+ ${fmt(calc.exp.road)}</div>
+            <div class="label">Others</div><div class="value num">+ ${fmt(calc.exp.others)}</div>
             <div class="label total">Trip Settlement</div><div class="value total num">${fmt(calc.settlement)}</div>
           </div>
         </div>`;
@@ -1648,8 +2013,10 @@ $('finalize-btn').addEventListener('click', finalize);
 
 function settlementId() {
   const d = today().replace(/-/g, '');
-  const seq = (loadStore(STORAGE.driverSummary, []).length + 1).toString().padStart(3, '0');
-  return `S-${d}-${state.driver.id}-${seq}`;
+  // Records now live in Firestore — local count isn't authoritative.
+  // Use the last 6 digits of the current ms to make the ID unique per submit.
+  const t = Date.now().toString().slice(-6);
+  return `S-${d}-${state.driver.id}-${t}`;
 }
 
 function buildSettlementPayload(sId, finalizedOn) {
@@ -1701,6 +2068,10 @@ function buildSettlementPayload(sId, finalizedOn) {
     'UPI Advances': upiAdv,
     'Account Advances': accountAdv,
     'Net Payable': net,
+    'Status': 'Submitted',
+    'Last Edited': '',
+    'Payment Date': '',
+    'Finalised On': '',
   };
 
   const byVehicle = {};
@@ -1724,7 +2095,7 @@ function buildSettlementPayload(sId, finalizedOn) {
     'Trips': v.trips,
     'Total Freight': v.freight,
     'Driver Pay Allocated': v.driverPay,
-    'Expenses (deducted)': v.expenses,
+    'Expenses (reimbursed)': v.expenses,
     'Halt Cost': v.halt,
     'Net Margin': v.freight - v.driverPay,
   }));
@@ -1757,49 +2128,49 @@ async function finalize() {
   const btn = $('finalize-btn');
   btn.disabled = true;
   const original = btn.textContent;
-  btn.innerHTML = '<span class="spinner"></span>Finalizing…';
+  btn.innerHTML = '<span class="spinner"></span>Submitting…';
   try {
     const sId = settlementId();
     const finalizedOn = today();
     const payload = buildSettlementPayload(sId, finalizedOn);
 
-    const writeToSheet = (state.mode === 'sheets' && state.historyConfigured);
+    if (!FIREBASE_READY || !currentUser.uid) {
+      alert('Sign in to submit a settlement.');
+      btn.disabled = false; btn.textContent = original; return;
+    }
+    if (!isBasic()) {
+      alert('Your account does not have permission to submit settlements.');
+      btn.disabled = false; btn.textContent = original; return;
+    }
 
-    // Always keep a complete local record — this powers the Records sheet / downloads.
-    saveStore(STORAGE.driverLog, loadStore(STORAGE.driverLog, []).concat(payload.driverLogRows));
-    saveStore(STORAGE.driverSummary, loadStore(STORAGE.driverSummary, []).concat([payload.summaryRow]));
-    saveStore(STORAGE.truckLog, loadStore(STORAGE.truckLog, []).concat(payload.truckLogRows));
-    saveStore(STORAGE.settlementAdvances, loadStore(STORAGE.settlementAdvances, []).concat(payload.advanceRows));
-    const idx = loadStore(STORAGE.settledIndex, {});
+    // Compose a single Firestore document per settlement — trips + advances + truck-log embedded.
+    const docData = Object.assign({}, payload.summaryRow, {
+      trips: payload.driverLogRows,
+      advances: payload.advanceRows,
+      truckLog: payload.truckLogRows,
+      createdBy: currentUser.uid,
+      createdByName: currentUser.name || '',
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+    });
+    await fbDb.collection('settlements').doc(sId).set(docData);
+
+    // In-session settled-trips index so the same trips can't be re-settled in another wizard run.
+    const idx = state.settledIndex || {};
     payload.settledIndexRows.forEach(r => {
       idx[r['Trip No']] = { driverId: r['Driver ID'], settlementId: r['Settlement ID'], settledOn: r['Settled On'] };
     });
-    saveStore(STORAGE.settledIndex, idx);
     state.settledIndex = idx;
-    saveStore(STORAGE.driverLastSettlement, Object.assign(loadStore(STORAGE.driverLastSettlement, {}), { [state.driver.id]: finalizedOn }));
-
-    // Additionally push to the Google Sheets history when a History sheet is configured.
-    if (writeToSheet) {
-      await proxyPost('finalize', {
-        driverLogRows: payload.driverLogRows,
-        summaryRow: payload.summaryRow,
-        truckLogRows: payload.truckLogRows,
-        settledIndexRows: payload.settledIndexRows,
-      });
-    }
 
     state.result.settlementId = sId;
     state.result.finalizedOn = finalizedOn;
-    const targetLabel = writeToSheet
-      ? 'Settlement History sheet + local Records'
-      : 'local Records (this browser) — view/download anytime via 🧾 Records';
+    const targetLabel = 'cloud Records (Firestore)';
     $('done-output').innerHTML = `
       <div class="info">
         <strong>Settlement ID:</strong> ${sId}<br>
         <strong>${state.driver.name}</strong> (${state.driver.id}) &nbsp;·&nbsp; ${state.periodFrom} → ${state.periodTo} &nbsp;·&nbsp; ${payload.trips.length} trips<br>
         <strong>Net payable:</strong> <span style="color:var(--accent);font-weight:700">${fmt(state.result.net)}</span>
       </div>
-      <div class="muted" style="margin-top:6px">Written to: <strong>${targetLabel}</strong></div>
+      <div class="muted" style="margin-top:6px">Status: <strong>Submitted</strong> · saved to <strong>${targetLabel}</strong>. Review &amp; finalise from <strong>🧾 Records</strong>.</div>
       <div class="summary-grid" style="margin-top:14px">
         <div class="label">Driver-log rows added</div><div class="value">${payload.driverLogRows.length}</div>
         <div class="label">Truck-log rows added</div><div class="value">${payload.truckLogRows.length}</div>
@@ -1808,8 +2179,10 @@ async function finalize() {
     `;
     refreshStorageStats();
     goStep(8);
+    // Hand over the printable PDF immediately on submit.
+    try { downloadPdf(); } catch (_) {}
   } catch (err) {
-    alert('Finalize failed: ' + err.message);
+    alert('Submit failed: ' + err.message);
     btn.disabled = false;
     btn.textContent = original;
     return;
@@ -1819,82 +2192,122 @@ async function finalize() {
 }
 
 // ---------- PDF Generation ----------
-function downloadPdf() {
-  if (!state.result) return;
+// Assemble a render bundle from the live wizard state (Submit time).
+function bundleFromState() {
+  const r = state.result;
+  return {
+    driver: { name: state.driver.name, id: state.driver.id, phone: state.driver.phone },
+    period: { from: state.periodFrom, to: state.periodTo },
+    settlementId: r.settlementId, date: r.finalizedOn, status: 'Submitted', paymentDate: '',
+    summary: {
+      gross: r.gross, incentive: state.incentive, incentiveReason: state.incentiveReason,
+      penalty: state.penalty, penaltyReason: state.penaltyReason,
+      cashAdv: r.cashAdv, upiAdv: r.upiAdv, accountAdv: r.accountAdv, net: r.net,
+    },
+    tripRows: r.trips.map(({ ti, calc }) => ({
+      date: ti.trip.tripStart, tripNo: ti.trip.tripNo, vehicle: ti.trip.vehicle,
+      route: `${ti.trip.from} → ${ti.trip.to}`, km: ti.trip.totalKm || 0, days: tripDuration(ti.trip),
+      pctLabel: ti.tripType === 'Full' ? '100%' : ti.partialPct + '%',
+      fixed: calc.fixedPay, halt: calc.haltTotal,
+      expLoadUnload: calc.exp.loadUnload, expRepairs: calc.exp.repairs, expToll: calc.exp.toll,
+      expRoad: calc.exp.road, expOthers: calc.exp.others, expTotal: calc.expensesTotal, settlement: calc.settlement,
+    })),
+    advanceRows: state.advances.filter(a => !a.removed).map(a => ({
+      date: a.date, mode: a.mode, type: a.type, amount: a.amount, deducted: isDeductibleAdvance(a),
+    })),
+    editLogRows: [],
+  };
+}
+
+// Assemble a render bundle from the currently-opened Firestore settlement (Records time).
+function bundleFromStored(id) {
+  const s = (state.records && state.records.opened && state.records.opened._id === id) ? state.records.opened : null;
+  if (!s) return null;
+  const trips = s.trips || [];
+  const advances = s.advances || [];
+  const edits = state.records.openedEditLog || [];
+  const num = v => Number(v) || 0;
+  return {
+    driver: { name: s['Driver Name'], id: s['Driver ID'], phone: '' },
+    period: { from: s['Period From'], to: s['Period To'] },
+    settlementId: id, date: s['Date'], status: s['Status'] || 'Submitted', paymentDate: s['Payment Date'] || '',
+    summary: {
+      gross: num(s['Gross']), incentive: num(s['Incentive']), incentiveReason: s['Incentive Reason'] || '',
+      penalty: num(s['Penalty']), penaltyReason: s['Penalty Reason'] || '',
+      cashAdv: num(s['Cash Advances']), upiAdv: num(s['UPI Advances']), accountAdv: num(s['Account Advances']), net: num(s['Net Payable']),
+    },
+    tripRows: trips.map(t => ({
+      date: t['Trip Date'], tripNo: t['Trip No'], vehicle: t['Vehicle'], route: t['Route'],
+      km: num(t['KMs Ran']), days: t['Trip Days'], pctLabel: (t['Trip %'] != null ? t['Trip %'] : 100) + '%',
+      fixed: num(t['Fixed Rate']) * (num(t['Trip %']) || 100) / 100, halt: num(t['Halt Total']),
+      expLoadUnload: num(t['Exp Loading/Unloading']), expRepairs: num(t['Exp Repairs']), expToll: num(t['Exp Toll']),
+      expRoad: num(t['Exp Road']), expOthers: num(t['Exp Others']), expTotal: num(t['Expenses Total']), settlement: num(t['Trip Settlement']),
+    })),
+    advanceRows: advances.map(a => ({
+      date: a['Advance Date'], mode: a['Mode'], type: a['Type'], amount: num(a['Amount']), deducted: a['Deducted'] === 'Yes',
+    })),
+    editLogRows: edits.map(e => ({
+      timestamp: e.timestamp, editedBy: e.editedBy, scope: e.scope, field: e.field, oldValue: e.oldValue, newValue: e.newValue,
+    })),
+  };
+}
+
+function renderSettlementPdf(b) {
+  if (!b) return;
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({ unit: 'mm', format: 'a4' });
   const w = doc.internal.pageSize.getWidth();
+  const pageH = doc.internal.pageSize.getHeight();
+  const ensure = (need) => { if (y + need > pageH - 12) { doc.addPage(); y = 20; } };
 
   // Header
   doc.setFillColor(15, 52, 96);
   doc.rect(0, 0, w, 28, 'F');
   doc.setTextColor(245, 197, 24);
-  doc.setFontSize(18);
-  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(18); doc.setFont('helvetica', 'bold');
   doc.text('GRUBUS Trading Pvt Ltd', 14, 14);
   doc.setTextColor(255, 255, 255);
-  doc.setFontSize(11);
-  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(11); doc.setFont('helvetica', 'normal');
   doc.text('Driver Settlement Statement', 14, 22);
+  // Status stamp (top-right)
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(12);
+  doc.setTextColor(b.status === 'Paid' ? 245 : 255, b.status === 'Paid' ? 197 : 255, b.status === 'Paid' ? 24 : 255);
+  doc.text(String(b.status || 'Submitted').toUpperCase(), w - 14, 16, { align: 'right' });
 
   // Driver block
-  doc.setTextColor(0, 0, 0);
-  doc.setFontSize(10);
+  doc.setTextColor(0, 0, 0); doc.setFont('helvetica', 'normal'); doc.setFontSize(10);
   let y = 38;
-  doc.text(`Driver: ${state.driver.name}`, 14, y);
-  doc.text(`ID: ${state.driver.id}`, 105, y);
+  doc.text(`Driver: ${b.driver.name}`, 14, y);
+  doc.text(`ID: ${b.driver.id}`, 105, y);
   y += 6;
-  doc.text(`Phone: ${state.driver.phone || '—'}`, 14, y);
-  doc.text(`Settlement ID: ${state.result.settlementId}`, 105, y);
+  doc.text(`Phone: ${b.driver.phone || '—'}`, 14, y);
+  doc.text(`Settlement ID: ${b.settlementId}`, 105, y);
   y += 6;
-  doc.text(`Period: ${state.periodFrom}  →  ${state.periodTo}`, 14, y);
-  doc.text(`Issued: ${state.result.finalizedOn}`, 105, y);
+  doc.text(`Period: ${b.period.from}  →  ${b.period.to}`, 14, y);
+  doc.text(`Issued: ${b.date}`, 105, y);
   y += 8;
 
-  // Trip table — full details (KM, days, fixed, halt, expenses)
+  // Trip table
   doc.setFontSize(10); doc.setFont('helvetica', 'bold'); doc.setTextColor(0, 0, 0);
   doc.text('Trip Details', 14, y); y += 2;
-  const tripRows = state.result.trips.map(({ ti, calc }, i) => [
-    i + 1,
-    ti.trip.tripStart || '—',
-    ti.trip.tripNo,
-    ti.trip.vehicle,
-    `${ti.trip.from} → ${ti.trip.to}`,
-    fmtNum(ti.trip.totalKm || 0),
-    tripDuration(ti.trip),
-    ti.tripType === 'Full' ? '100%' : ti.partialPct + '%',
-    fmtNum(calc.fixedPay),
-    fmtNum(calc.haltTotal),
-    fmtNum(calc.expensesTotal),
-    fmtNum(calc.settlement),
-  ]);
   doc.autoTable({
     startY: y,
     head: [['#', 'Date', 'Trip No', 'Vehicle', 'Route', 'KM', 'Days', '%', 'Fixed', 'Halt', 'Exp', 'Total ₹']],
-    body: tripRows,
+    body: b.tripRows.map((t, i) => [i + 1, t.date || '—', t.tripNo, t.vehicle, t.route, fmtNum(t.km), t.days, t.pctLabel, fmtNum(t.fixed), fmtNum(t.halt), fmtNum(t.expTotal), fmtNum(t.settlement)]),
     styles: { fontSize: 7, cellPadding: 1.5 },
     headStyles: { fillColor: [15, 52, 96], textColor: [245, 197, 24] },
     columnStyles: { 5: { halign: 'right' }, 6: { halign: 'right' }, 8: { halign: 'right' }, 9: { halign: 'right' }, 10: { halign: 'right' }, 11: { halign: 'right' } },
   });
   y = doc.lastAutoTable.finalY + 8;
 
-  // Per-trip expense breakdown (all five categories allocated to each trip)
+  // Per-trip expense breakdown
+  ensure(20);
   doc.setFontSize(10); doc.setFont('helvetica', 'bold'); doc.setTextColor(0, 0, 0);
   doc.text('Expense Breakdown (per trip)', 14, y); y += 2;
-  const expRows = state.result.trips.map(({ ti, calc }, i) => [
-    i + 1,
-    ti.trip.tripNo,
-    fmtNum(calc.exp.loadUnload),
-    fmtNum(calc.exp.repairs),
-    fmtNum(calc.exp.toll),
-    fmtNum(calc.exp.road),
-    fmtNum(calc.exp.others),
-    fmtNum(calc.expensesTotal),
-  ]);
   doc.autoTable({
     startY: y,
     head: [['#', 'Trip No', 'Loading/Unload', 'Repairs', 'Toll+Mech', 'Road (RTO/Police)', 'Others', 'Total ₹']],
-    body: expRows,
+    body: b.tripRows.map((t, i) => [i + 1, t.tripNo, fmtNum(t.expLoadUnload), fmtNum(t.expRepairs), fmtNum(t.expToll), fmtNum(t.expRoad), fmtNum(t.expOthers), fmtNum(t.expTotal)]),
     styles: { fontSize: 7, cellPadding: 1.5 },
     headStyles: { fillColor: [15, 52, 96], textColor: [245, 197, 24] },
     columnStyles: { 2: { halign: 'right' }, 3: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right' }, 6: { halign: 'right' }, 7: { halign: 'right' } },
@@ -1902,15 +2315,14 @@ function downloadPdf() {
   y = doc.lastAutoTable.finalY + 10;
 
   // Advances deducted
-  const advRows = state.advances
-    .filter(a => !a.removed && isDeductibleAdvance(a))
-    .map(a => [a.date || '—', a.mode, a.type || '—', fmtNum(a.amount)]);
+  ensure(20);
+  const advBody = b.advanceRows.filter(a => a.deducted).map(a => [a.date || '—', a.mode, a.type || '—', fmtNum(a.amount)]);
   doc.setFontSize(10); doc.setFont('helvetica', 'bold'); doc.setTextColor(0, 0, 0);
   doc.text('Advances Deducted', 14, y); y += 2;
   doc.autoTable({
     startY: y,
     head: [['Date', 'Mode', 'Type', 'Amount ₹']],
-    body: advRows.length ? advRows : [['—', '—', 'No advances', '0']],
+    body: advBody.length ? advBody : [['—', '—', 'No advances', '0']],
     styles: { fontSize: 8, cellPadding: 2 },
     headStyles: { fillColor: [15, 52, 96], textColor: [245, 197, 24] },
     columnStyles: { 3: { halign: 'right' } },
@@ -1918,15 +2330,16 @@ function downloadPdf() {
   y = doc.lastAutoTable.finalY + 10;
 
   // Summary
-  const r = state.result;
+  ensure(40);
+  const sm = b.summary;
   const sumLines = [
-    ['Gross trip settlements', fmtNum(r.gross)],
-    ['Incentive (+)', fmtNum(state.incentive) + (state.incentiveReason ? `  (${state.incentiveReason})` : '')],
-    ['Penalty (−)', fmtNum(state.penalty) + (state.penaltyReason ? `  (${state.penaltyReason})` : '')],
-    ['Cash advances (−)', fmtNum(r.cashAdv)],
-    ['UPI advances (−)', fmtNum(r.upiAdv)],
-    ['Account advances (−)', fmtNum(r.accountAdv)],
-    ['NET PAYABLE', fmtNum(r.net)],
+    ['Gross trip settlements', fmtNum(sm.gross)],
+    ['Incentive (+)', fmtNum(sm.incentive) + (sm.incentiveReason ? `  (${sm.incentiveReason})` : '')],
+    ['Penalty (−)', fmtNum(sm.penalty) + (sm.penaltyReason ? `  (${sm.penaltyReason})` : '')],
+    ['Cash advances (−)', fmtNum(sm.cashAdv)],
+    ['UPI advances (−)', fmtNum(sm.upiAdv)],
+    ['Account advances (−)', fmtNum(sm.accountAdv)],
+    ['NET PAYABLE', fmtNum(sm.net)],
   ];
   doc.autoTable({
     startY: y,
@@ -1942,26 +2355,42 @@ function downloadPdf() {
       }
     },
   });
-  y = doc.lastAutoTable.finalY + 14;
+  y = doc.lastAutoTable.finalY + 10;
 
-  // ----- Signatures -----
+  // Edit history (only if the record was adjusted)
+  if (b.editLogRows && b.editLogRows.length) {
+    ensure(24);
+    doc.setFontSize(10); doc.setFont('helvetica', 'bold'); doc.setTextColor(0, 0, 0);
+    doc.text('Edit History (adjustments after submission)', 14, y); y += 2;
+    doc.autoTable({
+      startY: y,
+      head: [['When', 'Edited by', 'Field', 'Change (old → new)']],
+      body: b.editLogRows.map(e => [e.timestamp || '', e.editedBy || '—', (e.scope && e.scope !== 'summary' ? e.scope + ': ' : '') + e.field, `${e.oldValue} → ${e.newValue}`]),
+      styles: { fontSize: 7, cellPadding: 1.5 },
+      headStyles: { fillColor: [15, 52, 96], textColor: [245, 197, 24] },
+    });
+    y = doc.lastAutoTable.finalY + 10;
+  }
+
+  // Payment line (Paid records)
+  if (b.status === 'Paid') {
+    ensure(12);
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(11); doc.setTextColor(20, 120, 50);
+    doc.text(`PAID  ·  Payment Date: ${b.paymentDate || '—'}`, 14, y);
+    y += 10;
+  }
+
+  // Signatures
   const sigLabels = ['Prepared by', 'Cash', 'Account', 'UPI', 'Dispatch check', 'Finalised', 'Paid by'];
-  const pageH = doc.internal.pageSize.getHeight();
   const sigRows = Math.ceil(sigLabels.length / 2);
-  if (y + 14 + sigRows * 20 > pageH - 12) { doc.addPage(); y = 20; }
-  doc.setTextColor(0, 0, 0);
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(11);
-  doc.text('Signatures', 14, y);
-  y += 10;
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(9);
+  ensure(14 + sigRows * 20);
+  doc.setTextColor(0, 0, 0); doc.setFont('helvetica', 'bold'); doc.setFontSize(11);
+  doc.text('Signatures', 14, y); y += 10;
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(9);
   const colW = (w - 28) / 2;
   sigLabels.forEach((lab, i) => {
-    const col = i % 2;
-    const rowi = Math.floor(i / 2);
-    const x = 14 + col * colW;
-    const ly = y + rowi * 20;
+    const col = i % 2, rowi = Math.floor(i / 2);
+    const x = 14 + col * colW, ly = y + rowi * 20;
     doc.setDrawColor(140, 140, 140);
     doc.line(x, ly + 6, x + colW - 12, ly + 6);
     doc.setTextColor(80, 80, 80);
@@ -1969,14 +2398,20 @@ function downloadPdf() {
   });
   y = y + sigRows * 20 + 4;
 
-  if (y > pageH - 16) { doc.addPage(); y = 20; }
-  doc.setFontSize(8);
-  doc.setTextColor(120, 120, 120);
+  ensure(12);
+  doc.setFontSize(8); doc.setTextColor(120, 120, 120);
   doc.text('Disputes within 7 days. Authorized signatory required for payment release.', 14, y);
   y += 5;
-  doc.text(`Settlement ID: ${state.result.settlementId}  ·  Generated ${new Date().toISOString()}`, 14, y);
+  doc.text(`Settlement ID: ${b.settlementId}  ·  Generated ${new Date().toISOString()}`, 14, y);
 
-  doc.save(`Settlement_${state.driver.id}_${state.result.finalizedOn.replace(/-/g, '')}.pdf`);
+  const suffix = b.status === 'Paid' ? '_FINAL' : '';
+  doc.save(`Settlement_${b.driver.id}_${String(b.date || today()).replace(/-/g, '')}${suffix}.pdf`);
+}
+
+// Done-step button: render the just-submitted settlement from live state.
+function downloadPdf() {
+  if (!state.result) return;
+  renderSettlementPdf(bundleFromState());
 }
 
 // ---------- Exports ----------

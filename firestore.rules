@@ -1,0 +1,72 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helpers ─────────────────────────────────────────────────────────
+    function isAuthed() {
+      return request.auth != null;
+    }
+    function role() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+    function isBasic()   { return isAuthed() && role() in ['basic', 'manager', 'admin']; }
+    function isManager() { return isAuthed() && role() in ['manager', 'admin']; }
+    function isAdmin()   { return isAuthed() && role() == 'admin'; }
+
+    // ── Users ───────────────────────────────────────────────────────────
+    // Each authed user can read their own profile. Admins can read all.
+    // User docs are provisioned offline (via the provisioning script) — no
+    // self-service writes from the app.
+    match /users/{uid} {
+      allow read: if isAuthed() && (request.auth.uid == uid || isAdmin());
+      allow write: if isAdmin();
+    }
+
+    // ── Settlements ─────────────────────────────────────────────────────
+    // Status lifecycle: Submitted → Verified → Paid (Paid is locked).
+    match /settlements/{settlementId} {
+      // Any valid signed-in user can read records.
+      allow read: if isBasic();
+
+      // Basic+ can create. Force initial state = Submitted and createdBy = self.
+      allow create: if isBasic()
+        && request.resource.data.status == 'Submitted'
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.paymentDate == ''
+        && request.resource.data.finalisedOn == '';
+
+      // Once Paid, the record is immutable.
+      // Managers can update everything EXCEPT setting status to 'Paid' and
+      // EXCEPT changing paymentDate / finalisedOn — those are admin-only.
+      // Admins can do anything (incl. paying), as long as the record isn't already Paid.
+      allow update: if isManager()
+        && resource.data.status != 'Paid'
+        && (
+          isAdmin()
+          || (
+            request.resource.data.status != 'Paid'
+            && request.resource.data.paymentDate == resource.data.paymentDate
+            && request.resource.data.finalisedOn == resource.data.finalisedOn
+          )
+        );
+
+      allow delete: if isAdmin();
+
+      // ── Edit Log subcollection ─ append-only audit trail ──────────────
+      match /editLog/{entryId} {
+        allow read: if isBasic();
+        // Only manager+ can record edits (basic cannot edit). The entry's
+        // editedByUid must match the writer.
+        allow create: if isManager()
+          && request.resource.data.editedByUid == request.auth.uid;
+        // Audit trail is immutable.
+        allow update, delete: if false;
+      }
+    }
+
+    // ── Default deny ────────────────────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
