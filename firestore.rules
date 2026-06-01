@@ -29,24 +29,26 @@ service cloud.firestore {
       allow read: if isBasic();
 
       // Basic+ can create. Force initial state = Submitted and createdBy = self.
+      // Field names in the doc are Title-Case with spaces ('Status', 'Payment Date',
+      // 'Finalised On') because buildSettlementPayload writes them that way.
       allow create: if isBasic()
-        && request.resource.data.status == 'Submitted'
+        && request.resource.data['Status'] == 'Submitted'
         && request.resource.data.createdBy == request.auth.uid
-        && request.resource.data.paymentDate == ''
-        && request.resource.data.finalisedOn == '';
+        && request.resource.data['Payment Date'] == ''
+        && request.resource.data['Finalised On'] == '';
 
       // Once Paid, the record is immutable.
-      // Managers can update everything EXCEPT setting status to 'Paid' and
-      // EXCEPT changing paymentDate / finalisedOn — those are admin-only.
+      // Managers can update everything EXCEPT setting Status to 'Paid' and
+      // EXCEPT changing Payment Date / Finalised On — those are admin-only.
       // Admins can do anything (incl. paying), as long as the record isn't already Paid.
       allow update: if isManager()
-        && resource.data.status != 'Paid'
+        && resource.data['Status'] != 'Paid'
         && (
           isAdmin()
           || (
-            request.resource.data.status != 'Paid'
-            && request.resource.data.paymentDate == resource.data.paymentDate
-            && request.resource.data.finalisedOn == resource.data.finalisedOn
+            request.resource.data['Status'] != 'Paid'
+            && request.resource.data['Payment Date'] == resource.data['Payment Date']
+            && request.resource.data['Finalised On'] == resource.data['Finalised On']
           )
         );
 
