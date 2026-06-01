@@ -26,7 +26,9 @@ const CONFIG = {
 
   /* Tab names inside the workbook above.                                     */
   dispatchTab: 'DISPATCH SHEET',
-  settlementDataTab: 'Settlement Data',
+  moneyAdvanceTab: 'MONEY ADVANCE SHEET',
+  upiSheetTab: 'UPI SHEET',
+  cashSheetTab: 'CASH SHEET',
   driverDetailsTab: 'Driver Details',
   allVehicleTab: 'All Vehicle',
 
@@ -39,7 +41,9 @@ const CONFIG = {
 
 const SOURCES = {
   dispatch:       () => [CONFIG.workbookId,        CONFIG.dispatchTab],
-  settlementData: () => [CONFIG.workbookId,        CONFIG.settlementDataTab],
+  moneyAdvance:   () => [CONFIG.workbookId,        CONFIG.moneyAdvanceTab],
+  upiSheet:       () => [CONFIG.workbookId,        CONFIG.upiSheetTab],
+  cashSheet:      () => [CONFIG.workbookId,        CONFIG.cashSheetTab],
   driverDetails:  () => [CONFIG.workbookId,        CONFIG.driverDetailsTab],
   allVehicle:     () => [CONFIG.workbookId,        CONFIG.allVehicleTab],
   historyTrip:    () => [CONFIG.historySheetId,    CONFIG.historyTripTab],
@@ -49,11 +53,9 @@ const SOURCES = {
 };
 
 // Some tabs carry a banner/metadata row above the real header. Map source →
-// 1-based row that holds the column headers (default 1). Settlement Data has a
-// Start/End-date banner on row 1, so its headers are on row 2.
-const HEADER_ROW = {
-  settlementData: 2,
-};
+// 1-based row that holds the column headers (default 1). MONEY ADVANCE SHEET
+// has its headers on row 1, no banner.
+const HEADER_ROW = {};
 
 function doGet(e) {
   return wrap_(() => {
@@ -64,7 +66,9 @@ function doGet(e) {
         time: new Date().toISOString(),
         configured: {
           dispatch:       !!CONFIG.workbookId,
-          settlementData: !!CONFIG.workbookId,
+          moneyAdvance:   !!CONFIG.workbookId,
+          upiSheet:       !!CONFIG.workbookId,
+          cashSheet:      !!CONFIG.workbookId,
           driverDetails:  !!CONFIG.workbookId,
           allVehicle:     !!CONFIG.workbookId,
           history:        !!CONFIG.historySheetId,

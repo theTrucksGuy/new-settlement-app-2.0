@@ -1083,9 +1083,11 @@ async function connectAndLoad() {
     const ping = await proxyGet('ping');
     statusEl.innerHTML = '<div class="info"><span class="spinner"></span>Loading dispatch, settlement data &amp; drivers…</div>';
 
-    const [dispatch, advances, driverDetails, allVehicle, settledRes] = await Promise.all([
+    const [dispatch, advances, upi, cash, driverDetails, allVehicle, settledRes] = await Promise.all([
       proxyGet('read', { which: 'dispatch' }).then(r => r.rows || []),
-      proxyGet('read', { which: 'settlementData' }).then(r => r.rows || []),
+      proxyGet('read', { which: 'moneyAdvance' }).then(r => r.rows || []),
+      proxyGet('read', { which: 'upiSheet' }).then(r => r.rows || []),
+      proxyGet('read', { which: 'cashSheet' }).then(r => r.rows || []),
       proxyGet('read', { which: 'driverDetails' }).then(r => r.rows || []),
       proxyGet('read', { which: 'allVehicle' }).then(r => r.rows || []),
       proxyPost('settledIndex'),
@@ -1101,6 +1103,8 @@ async function connectAndLoad() {
       routes: [],
       repairs: [],
       advances,
+      upi,
+      cash,
     };
     state.vehicleClass = buildVehicleClass(allVehicle);
     state.settledIndex = (settledRes && settledRes.settled) || {};
@@ -1113,7 +1117,7 @@ async function connectAndLoad() {
       <div class="muted">${cfgPills}</div>
       <div style="margin-top:8px">
         Dispatch: <strong>${dispatch.length}</strong> rows &nbsp;·&nbsp;
-        Settlement Data: <strong>${advances.length}</strong> rows &nbsp;·&nbsp;
+        Money Advance: <strong>${advances.length}</strong> · UPI: <strong>${upi.length}</strong> · Cash: <strong>${cash.length}</strong> &nbsp;·&nbsp;
         Driver Details: <strong>${driverDetails.length}</strong> &nbsp;·&nbsp;
         Vehicles classified: <strong>${Object.keys(state.vehicleClass).length}</strong> &nbsp;·&nbsp;
         Settled trips on file: <strong>${Object.keys(state.settledIndex).length}</strong>
@@ -1191,8 +1195,10 @@ function loadWorkbook(file) {
         attendancePrev: [],
         routes: [],
         repairs: [],
-        // Settlement Data has a Start/End-date banner on row 1 → headers on row 2.
-        advances: readSheet(wb, findSheet(wb, 'settlement data'), { range: 1 }),
+        // MONEY ADVANCE SHEET / UPI SHEET / CASH SHEET — all read with default header on row 1.
+        advances: readSheet(wb, findSheet(wb, 'money advance')),
+        upi: readSheet(wb, findSheet(wb, 'upi sheet')),
+        cash: readSheet(wb, findSheet(wb, 'cash sheet')),
       };
       state.vehicleClass = buildVehicleClass(readSheet(wb, findSheet(wb, 'all vehicle')));
       const counts = Object.entries(state.sheets).map(([k,v]) => `${k}: <strong>${v.length}</strong>`).join(' &nbsp;·&nbsp; ');
@@ -1352,31 +1358,90 @@ function normalizePaymentType(raw) {
   return String(raw || '').trim();
 }
 
-// Reads the "Settlement Data" sheet. Each row holds a payment split across three
-// amount columns; the non-zero column implies the mode (Advance→Account, UPI→UPI,
-// Cash→Cash). One row can therefore yield up to three advance entries.
+// Parse REMARK 1 such as "TA D02131 AN8011" or "SL ADV D02020 AS6411".
+// Returns the advance type and the driver ID encoded in it.
+function parseAdvanceRemark(rem1) {
+  const tokens = String(rem1 || '').trim().split(/\s+/);
+  if (!tokens.length || !tokens[0]) return { type: '', driverId: '' };
+  let type = tokens[0].toUpperCase();
+  let driverIdx = 1;
+  if (type === 'SL' && tokens[1] && tokens[1].toUpperCase() === 'ADV') {
+    type = 'SL ADV';
+    driverIdx = 2;
+  }
+  return { type, driverId: (tokens[driverIdx] || '').toUpperCase() };
+}
+
+// UPI SHEET PARTICULARS such as "VIKASH KEVAT ( DRIVER ) D01625" → extract driver ID.
+function parseUpiParticulars(p) {
+  const m = String(p || '').match(/\(\s*DRIVER\s*\)\s*([A-Z0-9]+)/i);
+  return m ? m[1].toUpperCase() : '';
+}
+
+// Cash sheet uses free-text remarks; treat anything with SAL/SALARY as Salary Advance,
+// else default to Trip Advance.
+function parseCashType(remark, toLocation) {
+  const txt = ((remark || '') + ' ' + (toLocation || '')).toUpperCase();
+  if (/SAL[A-Z]*\s*ADV|SALARY/.test(txt)) return 'Salary Advance';
+  return 'Trip Advance';
+}
+
+// Pulls advances for the current driver from all three channels:
+//   MONEY ADVANCE SHEET → Account (NetBanking transfers, REMARK 1 encodes type+driver)
+//   UPI SHEET           → UPI     (Tally vouchers; PARTICULARS encodes the driver)
+//   CASH SHEET          → Cash    (REMARK encodes type; Driver ID col or name match)
 function fetchAdvancesForDriver() {
   const out = [];
-  for (const row of state.sheets.advances) {
-    const did = getCol(row, 'driver\\s*id');
-    if (!did || String(did).trim().toUpperCase() !== state.driver.id) continue;
-    const d = parseDate(getCol(row, 'date\\s*of\\s*payment', 'payment\\s*date', '^date'));
-    if (!d) continue;
-    if (d <= state.periodFrom) continue;
-    if (d > state.periodTo) continue;
+  const myId = String(state.driver.id || '').toUpperCase();
+  const myName = String(state.driver.name || '').trim().toLowerCase();
+  const inPeriod = d => d && d > state.periodFrom && d <= state.periodTo;
 
-    const type = normalizePaymentType(getCol(row, 'payment\\s*type', '^type$'));
-    const remark = String(getCol(row, 'purpose', 'route', 'reference', 'remark', 'note') || '').trim();
-    const channels = [
-      { mode: 'Account', amount: Number(getCol(row, 'advance\\s*amount') || 0) },
-      { mode: 'UPI',     amount: Number(getCol(row, 'upi\\s*amount') || 0) },
-      { mode: 'Cash',    amount: Number(getCol(row, 'cash\\s*amount') || 0) },
-    ];
-    for (const c of channels) {
-      if (!c.amount) continue;
-      out.push({ amount: c.amount, date: d, mode: c.mode, type, remark, removed: false, manual: false });
-    }
+  for (const row of state.sheets.advances || []) {
+    const parsed = parseAdvanceRemark(getCol(row, 'remark\\s*1'));
+    const didCol = String(getCol(row, 'driver\\s*id') || '').trim().toUpperCase();
+    const did = didCol || parsed.driverId;
+    if (!did || did !== myId) continue;
+    const d = parseDate(getCol(row, 'payment\\s*date', '^date'));
+    if (!inPeriod(d)) continue;
+    const amount = Number(getCol(row, 'amount')) || 0;
+    if (!amount) continue;
+    const type = normalizePaymentType(parsed.type || getCol(row, 'payment\\s*type', '^type$'));
+    const remark = String(getCol(row, 'purpose', 'reason', 'remark\\s*3', 'remark\\s*2') || '').trim();
+    out.push({ amount, date: d, mode: 'Account', type, remark, removed: false, manual: false });
   }
+
+  for (const row of state.sheets.upi || []) {
+    const voucher = String(getCol(row, 'voucher\\s*type') || '').trim().toLowerCase();
+    if (voucher && voucher !== 'payment') continue;     // skip Receipts (money in)
+    // Prefer the explicit Drivr ID / Driver ID column (note: workbook uses the typo "Drivr ID");
+    // fall back to parsing PARTICULARS like "VIKASH KEVAT ( DRIVER ) D01625".
+    const didCol = String(getCol(row, 'drivr\\s*id', 'driver\\s*id') || '').trim().toUpperCase();
+    const did = didCol || parseUpiParticulars(getCol(row, 'particulars'));
+    if (!did || did === 'D00000' || did !== myId) continue;
+    const d = parseDate(getCol(row, '^date'));
+    if (!inPeriod(d)) continue;
+    const amount = Number(getCol(row, 'imprest', 'icici', 'gross\\s*type')) || 0;
+    if (!amount) continue;
+    const remark = String(getCol(row, 'voucher\\s*no', 'particulars') || '').trim();
+    out.push({ amount, date: d, mode: 'UPI', type: 'Trip Advance', remark, removed: false, manual: false });
+  }
+
+  for (const row of state.sheets.cash || []) {
+    const didCol = String(getCol(row, 'driver\\s*id') || '').trim().toUpperCase();
+    const nameCol = String(getCol(row, 'driver\\s*name', '^name$') || '').trim().toLowerCase();
+    const matches = (didCol && didCol === myId) || (!didCol && myName && nameCol === myName);
+    if (!matches) continue;
+    // CASH SHEET has two date columns; "Standard Date" is the cleaned/normalized one
+    // while "DATE" can be the raw entry-form value (sometimes the wrong calendar day).
+    const d = parseDate(getCol(row, 'standard\\s*date', '^date'));
+    if (!inPeriod(d)) continue;
+    const amount = Number(getCol(row, 'amount')) || 0;
+    if (!amount) continue;
+    const remark = String(getCol(row, 'remark', 'to\\s*location') || '').trim();
+    const type = parseCashType(getCol(row, 'remark'), getCol(row, 'to\\s*location'));
+    out.push({ amount, date: d, mode: 'Cash', type, remark, removed: false, manual: false });
+  }
+
   return out;
 }
 
