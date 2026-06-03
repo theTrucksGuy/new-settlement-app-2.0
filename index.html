@@ -170,6 +170,38 @@
   </div>
 </div>
 
+<!-- Expense modal — log one expense at a time per trip -->
+<div id="expense-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:210;align-items:center;justify-content:center;padding:24px">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;width:min(420px,100%);padding:22px;box-shadow:0 20px 60px rgba(0,0,0,0.4)">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <h3 style="margin:0">➕ Log expense</h3>
+      <button class="secondary small" type="button" onclick="closeExpenseModal()">✕</button>
+    </div>
+    <div style="margin-bottom:10px">
+      <label>Category</label>
+      <select id="exp-modal-category">
+        <option value="loadUnload">Loading / Unloading</option>
+        <option value="repairs">Repairs (tyre, grease, etc.)</option>
+        <option value="toll">Toll (toll + mechanical)</option>
+        <option value="road">Road expense (RTO, Police)</option>
+        <option value="others">Others</option>
+      </select>
+    </div>
+    <div style="margin-bottom:10px">
+      <label>Amount (₹)</label>
+      <input type="number" id="exp-modal-amount" min="0" placeholder="0">
+    </div>
+    <div style="margin-bottom:14px">
+      <label>Note (optional)</label>
+      <input type="text" id="exp-modal-note" placeholder="e.g. Bilha → Chandrapur loading" maxlength="80">
+    </div>
+    <div class="actions" style="justify-content:flex-end;gap:8px">
+      <button class="secondary small" type="button" onclick="closeExpenseModal()">Cancel</button>
+      <button type="button" onclick="saveExpense()">Add expense</button>
+    </div>
+  </div>
+</div>
+
 <!-- Records modal -->
 <div id="records-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:200;align-items:center;justify-content:center;padding:24px">
   <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;width:min(900px,100%);max-height:90vh;overflow:auto;padding:22px;box-shadow:0 20px 60px rgba(0,0,0,0.4)">
@@ -494,18 +526,65 @@ const state = {
   vehicleClass: {},       // {vehicleNo: 'Truck' | 'Trailer'} — derived from All Vehicle wheel count
 };
 
-// ---------- Routes (locally persisted) ----------
-const ROUTES_KEY = 'traq_settlement_routes_v1';
+// ---------- Routes (shared in Firestore) + Vehicle types (per browser) ----------
 const VEHTYPES_KEY = 'traq_settlement_vehicleTypes_v1';
 
 function loadSavedRoutes() {
-  try { state.savedRoutes = JSON.parse(localStorage.getItem(ROUTES_KEY) || '[]'); }
-  catch (_) { state.savedRoutes = []; }
+  // Routes now live in Firestore; the snapshot listener (startRoutesSync) fills them in.
+  state.savedRoutes = [];
   try { state.vehicleTypes = JSON.parse(localStorage.getItem(VEHTYPES_KEY) || '{}'); }
   catch (_) { state.vehicleTypes = {}; }
 }
-function persistSavedRoutes() { localStorage.setItem(ROUTES_KEY, JSON.stringify(state.savedRoutes)); }
 function persistVehicleTypes() { localStorage.setItem(VEHTYPES_KEY, JSON.stringify(state.vehicleTypes)); }
+
+// Deterministic doc ID from From+To, so the same route created by different
+// users / browsers collapses onto one document instead of duplicating.
+function routeDocId(from, to) {
+  return ((from || '') + '__' + (to || '')).toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 200) || 'unnamed';
+}
+
+// Real-time sync — any change by any user is reflected everywhere within ~1s.
+let _routesUnsubscribe = null;
+function startRoutesSync() {
+  if (!FIREBASE_READY || !currentUser.uid || _routesUnsubscribe) return;
+  let firstSnap = true;
+  _routesUnsubscribe = fbDb.collection('routes').onSnapshot(async snap => {
+    state.savedRoutes = snap.docs.map(d => Object.assign({ _id: d.id }, d.data()))
+      .sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+    if (firstSnap) {
+      firstSnap = false;
+      // One-time migration: lift this browser's existing localStorage routes
+      // into Firestore so they're not lost. Deterministic IDs dedupe naturally.
+      try {
+        const local = JSON.parse(localStorage.getItem('traq_settlement_routes_v1') || '[]');
+        if (state.savedRoutes.length === 0 && local.length) {
+          for (const r of local) {
+            if (!r.from || !r.to || !r.truckRate || !r.trailerRate) continue;
+            await fbDb.collection('routes').doc(routeDocId(r.from, r.to)).set({
+              name: r.name || `${r.from} → ${r.to}`,
+              from: r.from, to: r.to,
+              truckRate: r.truckRate, trailerRate: r.trailerRate,
+              createdBy: currentUser.uid, createdByName: currentUser.name || '',
+              createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+              migratedFromLocal: true,
+            }, { merge: true });
+          }
+          localStorage.removeItem('traq_settlement_routes_v1');
+          return;   // listener will re-fire with the migrated routes
+        }
+      } catch (_) {}
+    }
+    if ($('routes-overlay') && $('routes-overlay').style.display === 'flex') renderSavedRoutesList();
+    if (state.tripInputs && state.tripInputs.length) {
+      try { renderTripLoop(); } catch (_) {}
+    }
+  }, err => console.error('routes sync failed:', err));
+}
+function stopRoutesSync() {
+  if (_routesUnsubscribe) { _routesUnsubscribe(); _routesUnsubscribe = null; }
+  state.savedRoutes = [];
+}
 
 function openRoutesModal() {
   $('routes-overlay').style.display = 'flex';
@@ -539,39 +618,55 @@ function escapeHtmlSimple(s) {
   return String(s ?? '').replace(/[&<>"']/g, ch => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[ch]));
 }
 
-window.addSavedRoute = () => {
+window.addSavedRoute = async () => {
+  if (!FIREBASE_READY || !currentUser.uid) { alert('Sign in first.'); return; }
   const from = ($('route-from-input').value || '').trim();
   const to = ($('route-to-input').value || '').trim();
   let name = ($('route-name-input').value || '').trim();
   const truckRate = Number($('route-truck-rate').value || 0);
   const trailerRate = Number($('route-trailer-rate').value || 0);
   if (!from || !to) { alert('From and To locations are required.'); return; }
-  if (!name) name = `${from} → ${to}`;   // auto-name from the route
+  if (!name) name = `${from} → ${to}`;
   if (truckRate <= 0 || trailerRate <= 0) { alert('Both truck rate and trailer rate must be positive.'); return; }
-  // Replace by matching From+To if it already exists
-  const existingIdx = state.savedRoutes.findIndex(r =>
-    String(r.from || '').trim().toLowerCase() === from.toLowerCase() &&
-    String(r.to || '').trim().toLowerCase() === to.toLowerCase());
-  const route = { name, from, to, truckRate, trailerRate };
-  if (existingIdx >= 0) state.savedRoutes[existingIdx] = route;
-  else state.savedRoutes.push(route);
-  persistSavedRoutes();
+
+  // Deterministic doc ID means same From+To always points to the same record —
+  // no duplicates whether two users add it from different machines or you
+  // re-add to update the rates.
+  const id = routeDocId(from, to);
+  const exists = state.savedRoutes.some(r => r._id === id);
+  const payload = {
+    name, from, to, truckRate, trailerRate,
+    updatedBy: currentUser.uid, updatedByName: currentUser.name || '',
+    updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+  };
+  if (!exists) {
+    payload.createdBy = currentUser.uid;
+    payload.createdByName = currentUser.name || '';
+    payload.createdAt = firebase.firestore.FieldValue.serverTimestamp();
+  }
+  try {
+    await fbDb.collection('routes').doc(id).set(payload, { merge: true });
+  } catch (err) {
+    alert('Failed to save route: ' + (err.message || err));
+    return;
+  }
   $('route-from-input').value = '';
   $('route-to-input').value = '';
   $('route-name-input').value = '';
   $('route-truck-rate').value = '';
   $('route-trailer-rate').value = '';
-  renderSavedRoutesList();
-  // Refresh trip cards if we're past step 4 — picker dropdowns must include the new route
-  if (state.tripInputs.length) renderTripLoop();
+  // The onSnapshot listener will re-render the list and trip dropdowns automatically.
 };
 
-window.deleteSavedRoute = (idx) => {
+window.deleteSavedRoute = async (idx) => {
+  const r = state.savedRoutes[idx];
+  if (!r || !r._id) return;
   if (!confirm('Delete this route?')) return;
-  state.savedRoutes.splice(idx, 1);
-  persistSavedRoutes();
-  renderSavedRoutesList();
-  if (state.tripInputs.length) renderTripLoop();
+  try {
+    await fbDb.collection('routes').doc(r._id).delete();
+  } catch (err) {
+    alert('Failed to delete route: ' + (err.message || err));
+  }
 };
 
 // ---------- helpers ----------
@@ -622,7 +717,10 @@ async function renderRecordsList() {
       <td>${escapeHtmlSimple((r['Driver Name'] || '') + ' (' + (r['Driver ID'] || '') + ')')}</td>
       <td class="right num">${fmt(Number(r['Net Payable']) || 0)}</td>
       <td>${statusBadge(r['Status'])}</td>
-      <td><button class="secondary small" type="button" onclick="openRecord('${sid}')">Open</button></td>
+      <td style="white-space:nowrap">
+        <button class="secondary small" type="button" onclick="openRecord('${sid}')">Open</button>
+        <button class="secondary small" type="button" onclick="downloadRecordPdf('${sid}')" title="Download PDF">📄 PDF</button>
+      </td>
     </tr>`;
   });
   html += '</tbody></table>';
@@ -834,12 +932,25 @@ async function finaliseAndPay(id) {
   renderSettlementPdf(bundleFromStored(id));
 }
 
-function downloadRecordPdf(id) {
-  if (!state.records.opened || state.records.opened._id !== id) {
-    openRecord(id).then(() => renderSettlementPdf(bundleFromStored(id)));
-    return;
+// Loads the settlement doc + its editLog into state.records cache without changing
+// the visible records view — used by the per-row "📄 PDF" button on the list.
+async function loadRecordIntoCache(id) {
+  const docSnap = await fbDb.collection('settlements').doc(id).get();
+  if (!docSnap.exists) throw new Error('Settlement not found');
+  state.records.opened = Object.assign({ _id: id }, docSnap.data());
+  const logSnap = await fbDb.collection('settlements').doc(id).collection('editLog').orderBy('timestamp', 'desc').get();
+  state.records.openedEditLog = logSnap.docs.map(d => Object.assign({ _id: d.id }, d.data()));
+}
+
+async function downloadRecordPdf(id) {
+  try {
+    if (!state.records.opened || state.records.opened._id !== id) {
+      await loadRecordIntoCache(id);
+    }
+    renderSettlementPdf(bundleFromStored(id));
+  } catch (err) {
+    alert('Failed to download PDF: ' + (err.message || err));
   }
-  renderSettlementPdf(bundleFromStored(id));
 }
 function openRecordsModal() { $('records-overlay').style.display = 'flex'; renderRecordsList(); }
 function closeRecordsModal() { $('records-overlay').style.display = 'none'; }
@@ -995,6 +1106,7 @@ $('login-form').addEventListener('submit', async () => {
 if (FIREBASE_READY) {
   fbAuth.onAuthStateChanged(async (u) => {
     if (!u) {
+      stopRoutesSync();
       Object.assign(currentUser, { uid: null, email: null, name: null, role: null });
       applyRoleGating();
       showLogin();
@@ -1011,6 +1123,7 @@ if (FIREBASE_READY) {
       Object.assign(currentUser, { uid: u.uid, email: u.email, name: p.name || u.email, role: p.role || 'basic' });
       hideLogin();
       applyRoleGating();
+      startRoutesSync();
     } catch (err) {
       console.error('Profile load failed:', err);
       showLogin('Failed to load profile: ' + (err.message || err));
@@ -1745,7 +1858,10 @@ function buildTripInputs() {
       vehicleType,                // 'Truck' | 'Trailer' — sticky per vehicle via localStorage
       chosenRouteName,            // auto-selected saved route (or user-picked later)
       fixedRate,
-      // Five expense categories — all DEDUCTED from the trip settlement.
+      // Expense entries are logged one-by-one via the popup. The five category
+      // totals (expLoadUnload etc.) are recomputed from this list and feed the
+      // existing calcTripSettlement math — the math itself is unchanged.
+      expenseEntries: [],
       expLoadUnload: 0,
       expRepairs: 0,
       expToll: 0,
@@ -1870,29 +1986,7 @@ function renderTripCard(ti, idx) {
         <div></div>
       </div>
       <h3 style="margin-top:14px">Expenses <span class="muted" style="font-weight:normal">(added to settlement — reimbursed to driver)</span></h3>
-      <div class="grid-3">
-        <div>
-          <label>Loading / Unloading</label>
-          <input type="number" min="0" value="${ti.expLoadUnload}" data-field="expLoadUnload" data-idx="${idx}" placeholder="0" />
-        </div>
-        <div>
-          <label>Repairs (tyre, grease, etc.)</label>
-          <input type="number" min="0" value="${ti.expRepairs}" data-field="expRepairs" data-idx="${idx}" placeholder="0" />
-        </div>
-        <div>
-          <label>Toll (toll + mechanical)</label>
-          <input type="number" min="0" value="${ti.expToll}" data-field="expToll" data-idx="${idx}" placeholder="0" />
-        </div>
-        <div>
-          <label>Road expense (RTO, Police)</label>
-          <input type="number" min="0" value="${ti.expRoad}" data-field="expRoad" data-idx="${idx}" placeholder="0" />
-        </div>
-        <div>
-          <label>Others</label>
-          <input type="number" min="0" value="${ti.expOthers}" data-field="expOthers" data-idx="${idx}" placeholder="0" />
-        </div>
-        <div></div>
-      </div>
+      ${renderTripExpenses(ti, idx)}
       <div class="grid-3" style="margin-top:8px">
         <div>
           <label>Halt Days (company-caused)</label>
@@ -1929,6 +2023,104 @@ function refreshTripSummary(idx) {
   const el = $('trip-sum-' + idx);
   if (el) el.innerHTML = tripSummaryInner(state.tripInputs[idx]);
 }
+
+// ---------- Per-trip expense logging (popup) ----------
+const EXPENSE_CATS = {
+  loadUnload: 'Loading / Unloading',
+  repairs:    'Repairs',
+  toll:       'Toll + Mechanical',
+  road:       'Road (RTO / Police)',
+  others:     'Others',
+};
+function expenseCategoryLabel(k) { return EXPENSE_CATS[k] || k; }
+
+// Recompute the five category totals (expLoadUnload etc.) from the entry list,
+// so the existing calc math keeps working unchanged.
+function recomputeTripExpenseTotals(ti) {
+  const tot = { loadUnload: 0, repairs: 0, toll: 0, road: 0, others: 0 };
+  for (const e of ti.expenseEntries || []) {
+    const c = e && e.category;
+    if (tot[c] != null) tot[c] += Number(e.amount) || 0;
+  }
+  ti.expLoadUnload = tot.loadUnload;
+  ti.expRepairs    = tot.repairs;
+  ti.expToll       = tot.toll;
+  ti.expRoad       = tot.road;
+  ti.expOthers     = tot.others;
+}
+
+function renderTripExpenses(ti, idx) {
+  const entries = ti.expenseEntries || [];
+  const total = entries.reduce((s, e) => s + (Number(e.amount) || 0), 0);
+  const rows = entries.length === 0
+    ? '<div class="muted" style="padding:8px 0">No expenses logged yet. Click "Log expense" to add one.</div>'
+    : entries.map((e, ei) => `
+        <div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px dashed var(--border)">
+          <span class="badge" style="min-width:130px">${escapeHtmlSimple(expenseCategoryLabel(e.category))}</span>
+          <span class="num" style="font-weight:600;min-width:80px;text-align:right">${fmt(Number(e.amount) || 0)}</span>
+          <span class="muted" style="flex:1;font-size:12px">${escapeHtmlSimple(e.note || '')}</span>
+          <button class="danger small" type="button" onclick="removeExpense(${idx}, ${ei})" title="Remove">✕</button>
+        </div>`).join('');
+  const totals = `
+    <div class="grid-3" style="margin-top:8px;font-size:12px">
+      <div><span class="muted">L/UL:</span> ${fmt(ti.expLoadUnload)}</div>
+      <div><span class="muted">Repairs:</span> ${fmt(ti.expRepairs)}</div>
+      <div><span class="muted">Toll:</span> ${fmt(ti.expToll)}</div>
+      <div><span class="muted">Road:</span> ${fmt(ti.expRoad)}</div>
+      <div><span class="muted">Others:</span> ${fmt(ti.expOthers)}</div>
+      <div style="font-weight:600">Total: ${fmt(total)}</div>
+    </div>`;
+  return `
+    <div class="actions" style="justify-content:flex-start;margin:6px 0">
+      <button class="secondary small" type="button" onclick="openExpenseModal(${idx})">➕ Log expense</button>
+    </div>
+    <div>${rows}</div>
+    ${totals}
+  `;
+}
+
+let _expenseTripIdx = null;
+function openExpenseModal(idx) {
+  _expenseTripIdx = idx;
+  $('exp-modal-category').value = 'loadUnload';
+  $('exp-modal-amount').value = '';
+  $('exp-modal-note').value = '';
+  $('expense-overlay').style.display = 'flex';
+  setTimeout(() => $('exp-modal-amount').focus(), 30);
+}
+function closeExpenseModal() {
+  $('expense-overlay').style.display = 'none';
+  _expenseTripIdx = null;
+}
+function saveExpense() {
+  if (_expenseTripIdx == null) return;
+  const cat = $('exp-modal-category').value;
+  const amt = Number($('exp-modal-amount').value) || 0;
+  const note = ($('exp-modal-note').value || '').trim();
+  if (!amt) { alert('Enter an amount.'); return; }
+  const ti = state.tripInputs[_expenseTripIdx];
+  if (!ti.expenseEntries) ti.expenseEntries = [];
+  ti.expenseEntries.push({ category: cat, amount: amt, note });
+  recomputeTripExpenseTotals(ti);
+  const tripIdx = _expenseTripIdx;
+  closeExpenseModal();
+  $('trip-card-' + tripIdx).outerHTML = renderTripCard(ti, tripIdx);
+  attachTripCardListeners(tripIdx);
+}
+function removeExpense(idx, entryIdx) {
+  const ti = state.tripInputs[idx];
+  if (!ti.expenseEntries) return;
+  ti.expenseEntries.splice(entryIdx, 1);
+  recomputeTripExpenseTotals(ti);
+  $('trip-card-' + idx).outerHTML = renderTripCard(ti, idx);
+  attachTripCardListeners(idx);
+}
+window.openExpenseModal = openExpenseModal;
+window.closeExpenseModal = closeExpenseModal;
+window.saveExpense = saveExpense;
+window.removeExpense = removeExpense;
+// Close on backdrop click (script runs at end of body, modal already in DOM)
+$('expense-overlay').addEventListener('click', e => { if (e.target.id === 'expense-overlay') closeExpenseModal(); });
 
 function attachTripCardListeners(idx) {
   document.querySelectorAll(`#trip-card-${idx} [data-field]`).forEach(el => {
@@ -2271,7 +2463,7 @@ function bundleFromState() {
     },
     tripRows: r.trips.map(({ ti, calc }) => ({
       date: ti.trip.tripStart, tripNo: ti.trip.tripNo, vehicle: ti.trip.vehicle,
-      route: `${ti.trip.from} → ${ti.trip.to}`, km: ti.trip.totalKm || 0, days: tripDuration(ti.trip),
+      route: `${ti.trip.from || ''} -> ${ti.trip.to || ''}`, km: ti.trip.totalKm || 0, days: tripDuration(ti.trip),
       pctLabel: ti.tripType === 'Full' ? '100%' : ti.partialPct + '%',
       fixed: calc.fixedPay, halt: calc.haltTotal,
       expLoadUnload: calc.exp.loadUnload, expRepairs: calc.exp.repairs, expToll: calc.exp.toll,
@@ -2302,7 +2494,10 @@ function bundleFromStored(id) {
       cashAdv: num(s['Cash Advances']), upiAdv: num(s['UPI Advances']), accountAdv: num(s['Account Advances']), net: num(s['Net Payable']),
     },
     tripRows: trips.map(t => ({
-      date: t['Trip Date'], tripNo: t['Trip No'], vehicle: t['Vehicle'], route: t['Route'],
+      date: t['Trip Date'], tripNo: t['Trip No'], vehicle: t['Vehicle'],
+      // Stored route was built with the Unicode arrow → which jsPDF's default font
+      // can't render. Swap to an ASCII arrow so the direction is clearly visible in the PDF.
+      route: String(t['Route'] || '').replace(/→/g, '->'),
       km: num(t['KMs Ran']), days: t['Trip Days'], pctLabel: (t['Trip %'] != null ? t['Trip %'] : 100) + '%',
       fixed: num(t['Fixed Rate']) * (num(t['Trip %']) || 100) / 100, halt: num(t['Halt Total']),
       expLoadUnload: num(t['Exp Loading/Unloading']), expRepairs: num(t['Exp Repairs']), expToll: num(t['Exp Toll']),
@@ -2320,82 +2515,147 @@ function bundleFromStored(id) {
 function renderSettlementPdf(b) {
   if (!b) return;
   const { jsPDF } = window.jspdf;
-  const doc = new jsPDF({ unit: 'mm', format: 'a4' });
-  const w = doc.internal.pageSize.getWidth();
-  const pageH = doc.internal.pageSize.getHeight();
-  const ensure = (need) => { if (y + need > pageH - 12) { doc.addPage(); y = 20; } };
+  const doc = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'landscape' });
+  const w = doc.internal.pageSize.getWidth();      // ~297
+  const pageH = doc.internal.pageSize.getHeight(); // ~210
+  let y;
+  // Bottom of every page is reserved for the signature strip (page 1) + the
+  // small footer line. Content tables and ensure() never enter this zone.
+  const FOOTER_RESERVED = 26;
+  const ensure = (need) => { if (y + need > pageH - FOOTER_RESERVED) { doc.addPage(); y = 14; } };
 
-  // Header
+  // Header band
   doc.setFillColor(15, 52, 96);
-  doc.rect(0, 0, w, 28, 'F');
+  doc.rect(0, 0, w, 22, 'F');
   doc.setTextColor(245, 197, 24);
-  doc.setFontSize(18); doc.setFont('helvetica', 'bold');
-  doc.text('GRUBUS Trading Pvt Ltd', 14, 14);
+  doc.setFontSize(15); doc.setFont('helvetica', 'bold');
+  doc.text('Daman Mandeep Roadlines Pvt Ltd', 14, 11);
   doc.setTextColor(255, 255, 255);
-  doc.setFontSize(11); doc.setFont('helvetica', 'normal');
-  doc.text('Driver Settlement Statement', 14, 22);
+  doc.setFontSize(9); doc.setFont('helvetica', 'normal');
+  doc.text('Driver Settlement Statement', 14, 17);
   // Status stamp (top-right)
   doc.setFont('helvetica', 'bold'); doc.setFontSize(12);
   doc.setTextColor(b.status === 'Paid' ? 245 : 255, b.status === 'Paid' ? 197 : 255, b.status === 'Paid' ? 24 : 255);
-  doc.text(String(b.status || 'Submitted').toUpperCase(), w - 14, 16, { align: 'right' });
+  doc.text(String(b.status || 'Submitted').toUpperCase(), w - 14, 13, { align: 'right' });
 
-  // Driver block
-  doc.setTextColor(0, 0, 0); doc.setFont('helvetica', 'normal'); doc.setFontSize(10);
-  let y = 38;
-  doc.text(`Driver: ${b.driver.name}`, 14, y);
-  doc.text(`ID: ${b.driver.id}`, 105, y);
+  // Driver info row — one line
+  doc.setTextColor(0, 0, 0); doc.setFont('helvetica', 'normal'); doc.setFontSize(8.5);
+  y = 28;
+  doc.text(`Driver: ${b.driver.name}  (${b.driver.id})`, 14, y);
+  doc.text(`Phone: ${b.driver.phone || '—'}`, 110, y);
+  doc.text(`Period: ${b.period.from} → ${b.period.to}`, 175, y);
+  doc.text(`Issued: ${b.date}`, w - 14, y, { align: 'right' });
+  y += 5;
+  doc.setFontSize(7.5); doc.setTextColor(110, 110, 110);
+  doc.text(`Settlement ID: ${b.settlementId}`, 14, y);
   y += 6;
-  doc.text(`Phone: ${b.driver.phone || '—'}`, 14, y);
-  doc.text(`Settlement ID: ${b.settlementId}`, 105, y);
-  y += 6;
-  doc.text(`Period: ${b.period.from}  →  ${b.period.to}`, 14, y);
-  doc.text(`Issued: ${b.date}`, 105, y);
-  y += 8;
 
-  // Trip table
-  doc.setFontSize(10); doc.setFont('helvetica', 'bold'); doc.setTextColor(0, 0, 0);
-  doc.text('Trip Details', 14, y); y += 2;
+  // ----- shared styles -----
+  const NAVY = [15, 52, 96], GOLD = [245, 197, 24], STRIPE = [247, 249, 252];
+  const FOOT = { fillColor: [232, 236, 244], textColor: [10, 30, 60], fontStyle: 'bold' };
+  const sectionAt = (title, ax, ay) => {
+    doc.setFontSize(9); doc.setFont('helvetica', 'bold'); doc.setTextColor(...NAVY);
+    doc.text(title, ax, ay);
+  };
+
+  // ----- Trip Details & Expenses (combined wide table) -----
+  const sum = (k) => b.tripRows.reduce((s, t) => s + (Number(t[k]) || 0), 0);
+  const totFixed = sum('fixed'), totHalt = sum('halt'), totSet = sum('settlement');
+  const totLU = sum('expLoadUnload'), totRep = sum('expRepairs'), totToll = sum('expToll'), totRoad = sum('expRoad'), totOth = sum('expOthers');
+  sectionAt('Trip Details & Expenses', 14, y); y += 2.5;
   doc.autoTable({
     startY: y,
-    head: [['#', 'Date', 'Trip No', 'Vehicle', 'Route', 'KM', 'Days', '%', 'Fixed', 'Halt', 'Exp', 'Total ₹']],
-    body: b.tripRows.map((t, i) => [i + 1, t.date || '—', t.tripNo, t.vehicle, t.route, fmtNum(t.km), t.days, t.pctLabel, fmtNum(t.fixed), fmtNum(t.halt), fmtNum(t.expTotal), fmtNum(t.settlement)]),
-    styles: { fontSize: 7, cellPadding: 1.5 },
-    headStyles: { fillColor: [15, 52, 96], textColor: [245, 197, 24] },
-    columnStyles: { 5: { halign: 'right' }, 6: { halign: 'right' }, 8: { halign: 'right' }, 9: { halign: 'right' }, 10: { halign: 'right' }, 11: { halign: 'right' } },
+    head: [['#', 'Date', 'Trip No', 'Vehicle', 'Route', 'KM', 'Days', '%', 'Fixed', 'Halt', 'L/UL', 'Repairs', 'Toll', 'Road', 'Others', 'Total ₹']],
+    body: b.tripRows.map((t, i) => [i + 1, t.date || '—', t.tripNo, t.vehicle, t.route, fmtNum(t.km), t.days, t.pctLabel, fmtNum(t.fixed), fmtNum(t.halt), fmtNum(t.expLoadUnload), fmtNum(t.expRepairs), fmtNum(t.expToll), fmtNum(t.expRoad), fmtNum(t.expOthers), fmtNum(t.settlement)]),
+    foot: [[{ content: `Totals (${b.tripRows.length})`, colSpan: 8, styles: { halign: 'right' } }, fmtNum(totFixed), fmtNum(totHalt), fmtNum(totLU), fmtNum(totRep), fmtNum(totToll), fmtNum(totRoad), fmtNum(totOth), fmtNum(totSet)]],
+    styles: { fontSize: 7, cellPadding: 1.6, overflow: 'linebreak' },
+    headStyles: { fillColor: NAVY, textColor: GOLD, fontSize: 7 },
+    footStyles: FOOT,
+    alternateRowStyles: { fillColor: STRIPE },
+    margin: { bottom: FOOTER_RESERVED },
+    columnStyles: {
+      0:{cellWidth:6}, 1:{cellWidth:17}, 2:{cellWidth:20}, 3:{cellWidth:22},
+      4:{cellWidth:'auto'},
+      5:{halign:'right',cellWidth:13}, 6:{halign:'right',cellWidth:9}, 7:{halign:'right',cellWidth:10},
+      8:{halign:'right',cellWidth:15}, 9:{halign:'right',cellWidth:13},
+      10:{halign:'right',cellWidth:13}, 11:{halign:'right',cellWidth:13},
+      12:{halign:'right',cellWidth:11}, 13:{halign:'right',cellWidth:11}, 14:{halign:'right',cellWidth:13},
+      15:{halign:'right',cellWidth:19},
+    },
   });
-  y = doc.lastAutoTable.finalY + 8;
+  y = doc.lastAutoTable.finalY + 6;
 
-  // Per-trip expense breakdown
-  ensure(20);
-  doc.setFontSize(10); doc.setFont('helvetica', 'bold'); doc.setTextColor(0, 0, 0);
-  doc.text('Expense Breakdown (per trip)', 14, y); y += 2;
-  doc.autoTable({
-    startY: y,
-    head: [['#', 'Trip No', 'Loading/Unload', 'Repairs', 'Toll+Mech', 'Road (RTO/Police)', 'Others', 'Total ₹']],
-    body: b.tripRows.map((t, i) => [i + 1, t.tripNo, fmtNum(t.expLoadUnload), fmtNum(t.expRepairs), fmtNum(t.expToll), fmtNum(t.expRoad), fmtNum(t.expOthers), fmtNum(t.expTotal)]),
-    styles: { fontSize: 7, cellPadding: 1.5 },
-    headStyles: { fillColor: [15, 52, 96], textColor: [245, 197, 24] },
-    columnStyles: { 2: { halign: 'right' }, 3: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right' }, 6: { halign: 'right' }, 7: { halign: 'right' } },
-  });
-  y = doc.lastAutoTable.finalY + 10;
+  // ----- Advances (split into 2 columns: read top→bottom of col1, then col2) +
+  //       Net Settlement on the right — all three side by side -----
+  const colGap = 3;
+  const summaryW = 95;
+  const advColW = (w - 28 - 2 * colGap - summaryW) / 2;   // ~85mm each
+  const col1L = 14;
+  const col2L = col1L + advColW + colGap;
+  const sumL  = col2L + advColW + colGap;
 
-  // Advances deducted
-  ensure(20);
-  const advBody = b.advanceRows.filter(a => a.deducted).map(a => [a.date || '—', a.mode, a.type || '—', fmtNum(a.amount)]);
-  doc.setFontSize(10); doc.setFont('helvetica', 'bold'); doc.setTextColor(0, 0, 0);
-  doc.text('Advances Deducted', 14, y); y += 2;
+  const adv = b.advanceRows.filter(a => a.deducted);
+  const half = Math.ceil(adv.length / 2);
+  const advLeftRows  = adv.slice(0, half);
+  const advRightRows = adv.slice(half);
+  const toBody = arr => arr.map(a => [a.date || '—', a.mode, a.type || '—', fmtNum(a.amount)]);
+  const subL = advLeftRows.reduce((s, a) => s + (Number(a.amount) || 0), 0);
+  const subR = advRightRows.reduce((s, a) => s + (Number(a.amount) || 0), 0);
+
+  ensure(60);
+  const yRow = y;
+
+  // ---- Advances column 1 (left) ----
+  sectionAt('Advances Deducted', col1L, yRow);
   doc.autoTable({
-    startY: y,
+    startY: yRow + 2.5,
     head: [['Date', 'Mode', 'Type', 'Amount ₹']],
-    body: advBody.length ? advBody : [['—', '—', 'No advances', '0']],
-    styles: { fontSize: 8, cellPadding: 2 },
-    headStyles: { fillColor: [15, 52, 96], textColor: [245, 197, 24] },
+    body: advLeftRows.length ? toBody(advLeftRows) : [['—', '—', 'No advances', '0']],
+    foot: advLeftRows.length ? [[{ content: `Subtotal (${advLeftRows.length})`, colSpan: 3, styles: { halign: 'right' } }, fmtNum(subL)]] : undefined,
+    styles: { fontSize: 7.5, cellPadding: 1.6 },
+    headStyles: { fillColor: NAVY, textColor: GOLD },
+    footStyles: FOOT,
+    alternateRowStyles: { fillColor: STRIPE },
+    margin: { left: col1L, right: w - col1L - advColW, bottom: FOOTER_RESERVED },
     columnStyles: { 3: { halign: 'right' } },
   });
-  y = doc.lastAutoTable.finalY + 10;
+  const adv1FinalY = doc.lastAutoTable.finalY;
 
-  // Summary
-  ensure(40);
+  // ---- Advances column 2 (middle) — continues the list from col 1 ----
+  let adv2FinalY = yRow + 2.5;
+  if (advRightRows.length) {
+    sectionAt('(continued)', col2L, yRow);
+    doc.autoTable({
+      startY: yRow + 2.5,
+      head: [['Date', 'Mode', 'Type', 'Amount ₹']],
+      body: toBody(advRightRows),
+      foot: [[{ content: `Subtotal (${advRightRows.length})`, colSpan: 3, styles: { halign: 'right' } }, fmtNum(subR)]],
+      styles: { fontSize: 7.5, cellPadding: 1.6 },
+      headStyles: { fillColor: NAVY, textColor: GOLD },
+      footStyles: FOOT,
+      alternateRowStyles: { fillColor: STRIPE },
+      margin: { left: col2L, right: w - col2L - advColW, bottom: FOOTER_RESERVED },
+      columnStyles: { 3: { halign: 'right' } },
+    });
+    adv2FinalY = doc.lastAutoTable.finalY;
+  }
+
+  // ---- Combined "Total Advances" bar below the two columns ----
+  let advTotalsFinalY = Math.max(adv1FinalY, adv2FinalY);
+  if (adv.length > 0) {
+    const advGrand = subL + subR;
+    doc.autoTable({
+      startY: advTotalsFinalY + 1,
+      body: [[`Total Advances (${adv.length})`, fmtNum(advGrand)]],
+      styles: { fontSize: 9, cellPadding: 1.8, fontStyle: 'bold' },
+      bodyStyles: { fillColor: GOLD, textColor: [0, 0, 0] },
+      columnStyles: { 0: { halign: 'right' }, 1: { halign: 'right', cellWidth: 30 } },
+      margin: { left: col1L, right: w - (col2L + advColW), bottom: FOOTER_RESERVED },
+    });
+    advTotalsFinalY = doc.lastAutoTable.finalY;
+  }
+
+  // ---- Net Settlement summary (right) ----
   const sm = b.summary;
   const sumLines = [
     ['Gross trip settlements', fmtNum(sm.gross)],
@@ -2406,68 +2666,82 @@ function renderSettlementPdf(b) {
     ['Account advances (−)', fmtNum(sm.accountAdv)],
     ['NET PAYABLE', fmtNum(sm.net)],
   ];
+  sectionAt('Net Settlement', sumL, yRow);
   doc.autoTable({
-    startY: y,
+    startY: yRow + 2.5,
     body: sumLines,
-    styles: { fontSize: 10, cellPadding: 3 },
-    columnStyles: { 0: { cellWidth: 70 }, 1: { halign: 'right', fontStyle: 'bold' } },
+    styles: { fontSize: 9, cellPadding: 2.2 },
+    columnStyles: { 0: { cellWidth: 56 }, 1: { halign: 'right', fontStyle: 'bold' } },
+    alternateRowStyles: { fillColor: STRIPE },
+    margin: { left: sumL, right: 14, bottom: FOOTER_RESERVED },
     didParseCell: (data) => {
       if (data.row.index === sumLines.length - 1) {
         data.cell.styles.fontStyle = 'bold';
-        data.cell.styles.fillColor = [245, 197, 24];
+        data.cell.styles.fillColor = GOLD;
         data.cell.styles.textColor = [0, 0, 0];
         data.cell.styles.fontSize = 12;
       }
     },
   });
-  y = doc.lastAutoTable.finalY + 10;
+  const sumFinalY = doc.lastAutoTable.finalY;
+  y = Math.max(advTotalsFinalY, sumFinalY) + 6;
 
-  // Edit history (only if the record was adjusted)
+  // ----- Edit history (only if any) -----
   if (b.editLogRows && b.editLogRows.length) {
     ensure(24);
-    doc.setFontSize(10); doc.setFont('helvetica', 'bold'); doc.setTextColor(0, 0, 0);
-    doc.text('Edit History (adjustments after submission)', 14, y); y += 2;
+    sectionAt('Edit History', 14, y); y += 2.5;
     doc.autoTable({
       startY: y,
       head: [['When', 'Edited by', 'Field', 'Change (old → new)']],
       body: b.editLogRows.map(e => [e.timestamp || '', e.editedBy || '—', (e.scope && e.scope !== 'summary' ? e.scope + ': ' : '') + e.field, `${e.oldValue} → ${e.newValue}`]),
-      styles: { fontSize: 7, cellPadding: 1.5 },
-      headStyles: { fillColor: [15, 52, 96], textColor: [245, 197, 24] },
+      foot: [[{ content: `${b.editLogRows.length} change${b.editLogRows.length === 1 ? '' : 's'} logged`, colSpan: 4, styles: { halign: 'right' } }]],
+      styles: { fontSize: 7, cellPadding: 1.6 },
+      headStyles: { fillColor: NAVY, textColor: GOLD },
+      footStyles: FOOT,
+      alternateRowStyles: { fillColor: STRIPE },
+      margin: { bottom: FOOTER_RESERVED },
     });
-    y = doc.lastAutoTable.finalY + 10;
+    y = doc.lastAutoTable.finalY + 6;
   }
 
-  // Payment line (Paid records)
+  // ----- PAID stamp -----
   if (b.status === 'Paid') {
     ensure(12);
-    doc.setFont('helvetica', 'bold'); doc.setFontSize(11); doc.setTextColor(20, 120, 50);
-    doc.text(`PAID  ·  Payment Date: ${b.paymentDate || '—'}`, 14, y);
-    y += 10;
+    doc.setFillColor(228, 245, 230);
+    doc.setDrawColor(20, 120, 50);
+    doc.roundedRect(14, y - 2, w - 28, 10, 2, 2, 'FD');
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(10); doc.setTextColor(20, 120, 50);
+    doc.text(`PAID  ·  Payment Date: ${b.paymentDate || '—'}`, w / 2, y + 4, { align: 'center' });
+    y += 13;
   }
 
-  // Signatures
+  // ----- Signatures: anchored to the FOOTER of page 1 (fixed position) -----
+  doc.setPage(1);
   const sigLabels = ['Prepared by', 'Cash', 'Account', 'UPI', 'Dispatch check', 'Finalised', 'Paid by'];
-  const sigRows = Math.ceil(sigLabels.length / 2);
-  ensure(14 + sigRows * 20);
-  doc.setTextColor(0, 0, 0); doc.setFont('helvetica', 'bold'); doc.setFontSize(11);
-  doc.text('Signatures', 14, y); y += 10;
-  doc.setFont('helvetica', 'normal'); doc.setFontSize(9);
-  const colW = (w - 28) / 2;
+  const sigGap = (w - 28) / sigLabels.length;
+  const sigY = pageH - FOOTER_RESERVED;   // title baseline
+  doc.setTextColor(...NAVY); doc.setFont('helvetica', 'bold'); doc.setFontSize(9);
+  doc.text('Signatures', 14, sigY);
   sigLabels.forEach((lab, i) => {
-    const col = i % 2, rowi = Math.floor(i / 2);
-    const x = 14 + col * colW, ly = y + rowi * 20;
-    doc.setDrawColor(140, 140, 140);
-    doc.line(x, ly + 6, x + colW - 12, ly + 6);
-    doc.setTextColor(80, 80, 80);
-    doc.text(lab, x, ly + 11);
+    const x = 14 + i * sigGap;
+    doc.setDrawColor(160, 160, 160);
+    doc.line(x, sigY + 8, x + sigGap - 6, sigY + 8);
+    doc.setFont('helvetica', 'bold'); doc.setTextColor(60, 60, 60); doc.setFontSize(7.5);
+    doc.text(lab, x, sigY + 12);
+    doc.setFont('helvetica', 'normal'); doc.setTextColor(140, 140, 140); doc.setFontSize(6.5);
+    doc.text('Name / Date', x, sigY + 16);
   });
-  y = y + sigRows * 20 + 4;
 
-  ensure(12);
-  doc.setFontSize(8); doc.setTextColor(120, 120, 120);
-  doc.text('Disputes within 7 days. Authorized signatory required for payment release.', 14, y);
-  y += 5;
-  doc.text(`Settlement ID: ${b.settlementId}  ·  Generated ${new Date().toISOString()}`, 14, y);
+  // ----- Footer + page numbers (last pass) -----
+  const totalPages = doc.internal.getNumberOfPages();
+  for (let p = 1; p <= totalPages; p++) {
+    doc.setPage(p);
+    doc.setDrawColor(220, 220, 230);
+    doc.line(14, pageH - 8, w - 14, pageH - 8);
+    doc.setFontSize(7); doc.setTextColor(120, 120, 120);
+    doc.text(`Settlement ID: ${b.settlementId}  ·  Driver: ${b.driver.name} (${b.driver.id})  ·  Generated ${new Date().toLocaleString('en-IN')}`, 14, pageH - 4);
+    doc.text(`Page ${p} of ${totalPages}`, w - 14, pageH - 4, { align: 'right' });
+  }
 
   const suffix = b.status === 'Paid' ? '_FINAL' : '';
   doc.save(`Settlement_${b.driver.id}_${String(b.date || today()).replace(/-/g, '')}${suffix}.pdf`);

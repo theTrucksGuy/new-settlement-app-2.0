@@ -66,6 +66,13 @@ service cloud.firestore {
       }
     }
 
+    // ── Saved routes (shared rate master) ───────────────────────────────
+    // Any valid user can read and manage routes (matches the prior local
+    // behaviour where anyone could add a route in their own browser).
+    match /routes/{routeId} {
+      allow read, create, update, delete: if isBasic();
+    }
+
     // ── Default deny ────────────────────────────────────────────────────
     match /{document=**} {
       allow read, write: if false;
