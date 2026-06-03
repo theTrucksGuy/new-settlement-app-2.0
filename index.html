@@ -147,8 +147,20 @@
       <input type="number" id="route-trailer-rate" placeholder="Trailer rate ₹" min="0" />
       <div></div>
     </div>
-    <div class="actions" style="justify-content:flex-start;margin-top:8px">
-      <button class="secondary small" type="button" onclick="addSavedRoute()">+ Add route</button>
+    <h4 style="margin:14px 0 4px;font-size:12px;font-weight:600;color:var(--muted)">Preloaded expenses (optional)</h4>
+    <p class="muted" style="margin:0 0 6px;font-size:11px">When this route is picked on a trip, these amounts are auto-added as expense entries. Leave blank to skip.</p>
+    <div class="grid-3">
+      <input type="number" id="route-exp-loadunload" placeholder="Loading / Unloading ₹" min="0" />
+      <input type="number" id="route-exp-repairs"    placeholder="Repairs ₹" min="0" />
+      <input type="number" id="route-exp-toll"       placeholder="Toll + Mechanical ₹" min="0" />
+    </div>
+    <div class="grid-3" style="margin-top:6px">
+      <input type="number" id="route-exp-road"   placeholder="Road (RTO/Police) ₹" min="0" />
+      <input type="number" id="route-exp-others" placeholder="Others ₹" min="0" />
+      <div></div>
+    </div>
+    <div class="actions" style="justify-content:flex-start;margin-top:10px">
+      <button class="secondary small" type="button" onclick="addSavedRoute()">+ Add / Update route</button>
     </div>
     <h3 style="margin-top:18px">Saved routes</h3>
     <div id="saved-routes-list"></div>
@@ -599,15 +611,22 @@ function renderSavedRoutesList() {
     c.innerHTML = '<div class="muted">No routes saved yet. Add one above.</div>';
     return;
   }
-  let html = '<table><thead><tr><th>From → To</th><th>Name</th><th class="right">Truck rate</th><th class="right">Trailer rate</th><th></th></tr></thead><tbody>';
+  const canEdit = isAdmin();
+  let html = '<table><thead><tr><th>From → To</th><th>Name</th><th class="right">Truck rate</th><th class="right">Trailer rate</th><th>Preloaded ₹</th><th></th></tr></thead><tbody>';
   state.savedRoutes.forEach((r, i) => {
     const fromTo = (r.from || r.to) ? `${escapeHtmlSimple(r.from || '—')} → ${escapeHtmlSimple(r.to || '—')}` : '<span class="muted">(no match keys)</span>';
+    const preTotal = (Number(r.preExpLoadUnload)||0) + (Number(r.preExpRepairs)||0) + (Number(r.preExpToll)||0) + (Number(r.preExpRoad)||0) + (Number(r.preExpOthers)||0);
+    const preCell = preTotal > 0
+      ? `<span title="L/UL ${fmtNum(r.preExpLoadUnload||0)} · Repairs ${fmtNum(r.preExpRepairs||0)} · Toll ${fmtNum(r.preExpToll||0)} · Road ${fmtNum(r.preExpRoad||0)} · Others ${fmtNum(r.preExpOthers||0)}">${fmt(preTotal)}</span>`
+      : '<span class="muted">—</span>';
+    const editBtn = canEdit ? `<button class="secondary small" type="button" onclick="editSavedRoute(${i})">Edit</button>` : '';
     html += `<tr>
       <td>${fromTo}</td>
       <td>${escapeHtmlSimple(r.name)}</td>
       <td class="right num">${fmt(r.truckRate)}</td>
       <td class="right num">${fmt(r.trailerRate)}</td>
-      <td><button class="danger small" type="button" onclick="deleteSavedRoute(${i})">Delete</button></td>
+      <td class="right">${preCell}</td>
+      <td style="white-space:nowrap">${editBtn} <button class="danger small" type="button" onclick="deleteSavedRoute(${i})">Delete</button></td>
     </tr>`;
   });
   html += '</tbody></table>';
@@ -636,6 +655,11 @@ window.addSavedRoute = async () => {
   const exists = state.savedRoutes.some(r => r._id === id);
   const payload = {
     name, from, to, truckRate, trailerRate,
+    preExpLoadUnload: Number($('route-exp-loadunload').value) || 0,
+    preExpRepairs:    Number($('route-exp-repairs').value)    || 0,
+    preExpToll:       Number($('route-exp-toll').value)       || 0,
+    preExpRoad:       Number($('route-exp-road').value)       || 0,
+    preExpOthers:     Number($('route-exp-others').value)     || 0,
     updatedBy: currentUser.uid, updatedByName: currentUser.name || '',
     updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
   };
@@ -650,12 +674,31 @@ window.addSavedRoute = async () => {
     alert('Failed to save route: ' + (err.message || err));
     return;
   }
-  $('route-from-input').value = '';
-  $('route-to-input').value = '';
-  $('route-name-input').value = '';
-  $('route-truck-rate').value = '';
-  $('route-trailer-rate').value = '';
+  ['route-from-input','route-to-input','route-name-input',
+   'route-truck-rate','route-trailer-rate',
+   'route-exp-loadunload','route-exp-repairs','route-exp-toll','route-exp-road','route-exp-others']
+    .forEach(id => { const el = $(id); if (el) el.value = ''; });
   // The onSnapshot listener will re-render the list and trip dropdowns automatically.
+};
+
+// Admin-only: prefill the Add/Update form with this route's current values for editing.
+window.editSavedRoute = (idx) => {
+  if (!isAdmin()) { alert('Only admins can edit existing routes.'); return; }
+  const r = state.savedRoutes[idx];
+  if (!r) return;
+  $('route-from-input').value = r.from || '';
+  $('route-to-input').value = r.to || '';
+  $('route-name-input').value = r.name || '';
+  $('route-truck-rate').value = r.truckRate || '';
+  $('route-trailer-rate').value = r.trailerRate || '';
+  $('route-exp-loadunload').value = r.preExpLoadUnload || '';
+  $('route-exp-repairs').value    = r.preExpRepairs    || '';
+  $('route-exp-toll').value       = r.preExpToll       || '';
+  $('route-exp-road').value       = r.preExpRoad       || '';
+  $('route-exp-others').value     = r.preExpOthers     || '';
+  // Scroll the modal back to the form.
+  const fromEl = $('route-from-input');
+  if (fromEl) { fromEl.focus(); fromEl.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
 };
 
 window.deleteSavedRoute = async (idx) => {
@@ -1533,7 +1576,8 @@ function fetchAdvancesForDriver() {
     if (!did || did === 'D00000' || did !== myId) continue;
     const d = parseDate(getCol(row, '^date'));
     if (!inPeriod(d)) continue;
-    const amount = Number(getCol(row, 'imprest', 'icici', 'gross\\s*type')) || 0;
+    // UPI amount comes from column G — "GROSS TYPE" — not the IMPREST column H.
+    const amount = Number(getCol(row, 'gross\\s*type')) || 0;
     if (!amount) continue;
     const remark = String(getCol(row, 'voucher\\s*no', 'particulars') || '').trim();
     out.push({ amount, date: d, mode: 'UPI', type: 'Trip Advance', remark, removed: false, manual: false });
@@ -1853,7 +1897,7 @@ function buildTripInputs() {
       fixedRate = Math.max(CONFIG.fixedRateMin, Math.min(CONFIG.fixedRateMax,
         Math.round(suggestedRate / CONFIG.fixedRateStep) * CONFIG.fixedRateStep));
     }
-    return {
+    const newTi = {
       trip,
       vehicleType,                // 'Truck' | 'Trailer' — sticky per vehicle via localStorage
       chosenRouteName,            // auto-selected saved route (or user-picked later)
@@ -1873,17 +1917,33 @@ function buildTripInputs() {
       partialPct: CONFIG.partialPctDefault,
       confirmed: false,
     };
+    // If a route auto-matched, pull in its preloaded expenses as starter entries.
+    if (matched) applySavedRouteRate(newTi);
+    return newTi;
   });
 }
 
-// Recompute fixedRate based on chosenRouteName + vehicleType.
-// Bypasses the snap-to-step constraint when a saved-route rate is applied —
-// validateTripInput will tolerate it because the user explicitly opted in via the picker.
+// Reapply a saved route to a trip-input: set its fixed rate AND load the route's
+// preloaded expenses as auto-marked entries (fromRoute=true). Always strips any
+// previously auto-loaded entries first, so switching/clearing routes is clean.
 function applySavedRouteRate(ti) {
-  if (!ti.chosenRouteName) return;
+  ti.expenseEntries = (ti.expenseEntries || []).filter(e => !e.fromRoute);
+  if (!ti.chosenRouteName) { recomputeTripExpenseTotals(ti); return; }
   const r = state.savedRoutes.find(x => x.name === ti.chosenRouteName);
-  if (!r) return;
+  if (!r) { recomputeTripExpenseTotals(ti); return; }
   ti.fixedRate = ti.vehicleType === 'Trailer' ? r.trailerRate : r.truckRate;
+  const cats = [
+    ['loadUnload', r.preExpLoadUnload],
+    ['repairs',    r.preExpRepairs],
+    ['toll',       r.preExpToll],
+    ['road',       r.preExpRoad],
+    ['others',     r.preExpOthers],
+  ];
+  for (const [cat, amt] of cats) {
+    const n = Number(amt) || 0;
+    if (n > 0) ti.expenseEntries.push({ category: cat, amount: n, note: `from route: ${r.name}`, fromRoute: true });
+  }
+  recomputeTripExpenseTotals(ti);
 }
 
 function tripDuration(trip) {
@@ -2156,8 +2216,9 @@ function updateTripField(e) {
     if (ti.chosenRouteName) applySavedRouteRate(ti);
   }
   if (field === 'chosenRouteName') {
-    if (ti.chosenRouteName) applySavedRouteRate(ti);
-    // Clearing the route does NOT roll back to the snap rate — leaves current fixedRate as-is.
+    // Call regardless: when set → load rate + preloaded expenses.
+    // When cleared → strip any previously route-loaded expense entries.
+    applySavedRouteRate(ti);
   }
 
   // Re-render this card only
