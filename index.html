@@ -121,6 +121,7 @@
   <div class="meta">v1.0 &nbsp;·&nbsp; <span id="today-date"></span>
     &nbsp;·&nbsp; <button class="secondary small" id="open-routes-btn" type="button" style="margin-left:6px">📋 Routes</button>
     &nbsp;<button class="secondary small" id="open-records-btn" type="button">🧾 Records</button>
+    &nbsp;<button class="secondary small" id="open-driver-records-btn" type="button">📂 Folders</button>
     &nbsp;·&nbsp; <span id="user-info" class="muted"></span>
   </div>
 </header>
@@ -232,6 +233,23 @@
       <button class="danger small" type="button" onclick="clearRecords()">🗑 Clear all records</button>
     </div>
     <div id="records-list"></div>
+  </div>
+</div>
+
+<!-- Driver Records Folder modal -->
+<div id="driver-records-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:200;align-items:center;justify-content:center;padding:24px">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;width:min(900px,100%);max-height:90vh;overflow:auto;padding:22px;box-shadow:0 20px 60px rgba(0,0,0,0.4)">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px">
+      <div>
+        <h2 style="margin:0">📂 Driver Folders</h2>
+        <p class="muted" style="margin:4px 0 0">Settlements organized by driver. Search by Driver ID or Driver Name.</p>
+      </div>
+      <button class="secondary small" type="button" onclick="closeDriverRecordsModal()">✕</button>
+    </div>
+    <div style="margin-bottom:12px">
+      <input type="text" id="driver-records-search" placeholder="🔍 Search Driver ID or Name…" style="width:100%;padding:8px 10px;font-size:14px" autocomplete="off" />
+    </div>
+    <div id="driver-records-content"></div>
   </div>
 </div>
 
@@ -523,7 +541,13 @@ const state = {
   historyConfigured: false,  // true only when Apps Script has historySheetId set
   workbook: null,
   sheets: {},
-  settledIndex: {},      // { tripNo: {driverId, settlementId, settledOn} }
+  // Settled-from-prior-settlements lock index. Loaded from Firestore on sign-in and
+  // kept in sync via onSnapshot so locks lift the moment a settlement is deleted.
+  //   trips           — { [normalizedTripNo]: meta }
+  //   advancePeriods  — { [driverIdUpper]: [{from, to, settlementId, settledOn}, ...] }
+  //                     period-based: any advance dated within a settled period for
+  //                     that driver is locked, regardless of upload row contents.
+  settledIndex: { trips: {}, advancePeriods: {} },
   driver: null,
   periodFrom: null,
   periodTo: null,
@@ -599,6 +623,76 @@ function startRoutesSync() {
 function stopRoutesSync() {
   if (_routesUnsubscribe) { _routesUnsubscribe(); _routesUnsubscribe = null; }
   state.savedRoutes = [];
+}
+
+// ---------- Settled-trip / settled-advance lock index (live from Firestore) ----------
+// Listens to every settlement doc and rebuilds state.settledIndex.
+//   trips           — keyed by normalized Trip No (trim + uppercase) so case/whitespace
+//                     drift between workbook uploads cannot unlock a settled trip.
+//   advancePeriods  — { [driverIdUpper]: [{from, to, settlementId, settledOn}, ...] }
+//                     period-based locking: an advance is locked if its date falls
+//                     within ANY settled period for that driver. Survives re-uploads
+//                     because it does not depend on row content (remark, voucher,
+//                     amount rounding, etc.).
+// onSnapshot means:
+//   - User A submits a settlement on Browser 1 → User B's wizard on Browser 2 sees
+//     those trips/advances locked within ~1 s, no reload required.
+//   - An admin deletes a settlement → its trips and advances unlock automatically.
+let _settledIndexUnsubscribe = null;
+function startSettledIndexSync() {
+  if (!FIREBASE_READY || !currentUser.uid || _settledIndexUnsubscribe) return;
+  _settledIndexUnsubscribe = fbDb.collection('settlements').onSnapshot(snap => {
+    const trips = {};
+    const advancePeriods = {};
+    snap.forEach(doc => {
+      const d = doc.data() || {};
+      if (d['Status'] === 'Cancelled') return; // forward-compat; no such status today
+      const sId = d['Settlement ID'] || doc.id;
+      const settledOn = d['Settlement Date'] || d['Date'] || '';
+      const driverId = String(d['Driver ID'] || '').trim().toUpperCase();
+      const status = d['Status'] || '';
+      const meta = { settlementId: sId, settledOn, driverId, status };
+      (d.trips || d.driverLog || []).forEach(row => {
+        const tn = tripIdKey(row && row['Trip No']);
+        if (tn) trips[tn] = meta;
+      });
+      const from = d['Period From'] || '';
+      const to = d['Period To'] || '';
+      if (driverId && from && to) {
+        if (!advancePeriods[driverId]) advancePeriods[driverId] = [];
+        advancePeriods[driverId].push({ from, to, settlementId: sId, settledOn });
+      }
+    });
+    state.settledIndex = { trips, advancePeriods };
+    // Re-render any open wizard tables so locks appear immediately on changes
+    // from another browser.
+    try { if ($('trips-container') && $('trips-container').innerHTML) renderTrips(); } catch (_) {}
+    try { if ($('advances-container') && $('advances-container').innerHTML) renderAdvances(); } catch (_) {}
+  }, err => console.error('settled-index sync failed:', err));
+}
+function stopSettledIndexSync() {
+  if (_settledIndexUnsubscribe) { _settledIndexUnsubscribe(); _settledIndexUnsubscribe = null; }
+  state.settledIndex = { trips: {}, advancePeriods: {} };
+}
+
+// Normalize a Trip No for lock-index lookups — trim and uppercase so cosmetic
+// drift between two workbook uploads (e.g. trailing space, lowercase prefix)
+// cannot accidentally unlock a settled trip.
+function tripIdKey(tn) { return String(tn == null ? '' : tn).trim().toUpperCase(); }
+
+// Returns the settled-period meta that locks this advance for the current driver,
+// or null if no settled period covers its date. Period bounds match the wizard's
+// fetch filter (line: `d > periodFrom && d <= periodTo`), so back-to-back periods
+// using the previous periodTo as the next periodFrom do not double-lock.
+function findAdvanceLock(adv) {
+  if (!adv || !adv.date) return null;
+  const driverId = String((state.driver && state.driver.id) || '').trim().toUpperCase();
+  if (!driverId) return null;
+  const periods = (state.settledIndex && state.settledIndex.advancePeriods && state.settledIndex.advancePeriods[driverId]) || [];
+  for (const p of periods) {
+    if (p.from && p.to && adv.date > p.from && adv.date <= p.to) return p;
+  }
+  return null;
 }
 
 function openRoutesModal() {
@@ -822,6 +916,9 @@ $('open-routes-btn').addEventListener('click', openRoutesModal);
 $('routes-overlay').addEventListener('click', (e) => { if (e.target.id === 'routes-overlay') closeRoutesModal(); });
 $('open-records-btn').addEventListener('click', openRecordsModal);
 $('records-overlay').addEventListener('click', (e) => { if (e.target.id === 'records-overlay') closeRecordsModal(); });
+$('open-driver-records-btn').addEventListener('click', openDriverRecordsModal);
+$('driver-records-overlay').addEventListener('click', (e) => { if (e.target.id === 'driver-records-overlay') closeDriverRecordsModal(); });
+$('driver-records-search').addEventListener('input', (e) => renderDriverFolderList(e.target.value));
 
 // ---------- Settlement records: list → open → edit → verify → pay ----------
 function statusBadge(s) {
@@ -1153,6 +1250,114 @@ window.markVerified = markVerified;
 window.finaliseAndPay = finaliseAndPay;
 window.downloadRecordPdf = downloadRecordPdf;
 
+// ---------- Driver Folders modal (driver-grouped view of all settlements) ----------
+let _driverRecordsAll = [];
+
+async function openDriverRecordsModal() {
+  $('driver-records-overlay').style.display = 'flex';
+  const search = $('driver-records-search');
+  if (search) search.value = '';
+  const c = $('driver-records-content');
+  c.innerHTML = '<div class="muted">Loading settlements…</div>';
+  if (!FIREBASE_READY || !currentUser.uid) {
+    c.innerHTML = '<div class="warn-box">Sign in to view records.</div>';
+    return;
+  }
+  try {
+    const snap = await fbDb.collection('settlements').orderBy('Date', 'desc').limit(2000).get();
+    _driverRecordsAll = snap.docs.map(d => Object.assign({ _id: d.id }, d.data()));
+  } catch (err) {
+    c.innerHTML = '<div class="err-box">Failed to load: ' + escapeHtmlSimple(err.message || String(err)) + '</div>';
+    return;
+  }
+  renderDriverFolderList('');
+}
+function closeDriverRecordsModal() { $('driver-records-overlay').style.display = 'none'; }
+
+function renderDriverFolderList(filter) {
+  const c = $('driver-records-content');
+  // Group settlements by Driver ID.
+  const drivers = {};
+  for (const r of _driverRecordsAll) {
+    const id = String(r['Driver ID'] || '(unknown)');
+    const name = String(r['Driver Name'] || '');
+    if (!drivers[id]) drivers[id] = { id, name, count: 0, totalNet: 0, latest: null };
+    drivers[id].count++;
+    drivers[id].totalNet += Number(r['Net Payable']) || 0;
+    if (!drivers[id].latest || (r['Date'] || '') > (drivers[id].latest['Date'] || '')) drivers[id].latest = r;
+  }
+  const q = String(filter || '').trim().toLowerCase();
+  let list = Object.values(drivers);
+  if (q) list = list.filter(d => d.id.toLowerCase().includes(q) || (d.name || '').toLowerCase().includes(q));
+  list.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+  if (!_driverRecordsAll.length) { c.innerHTML = '<div class="muted">No settlements recorded yet.</div>'; return; }
+  if (!list.length)              { c.innerHTML = '<div class="muted">No drivers match "' + escapeHtmlSimple(q) + '".</div>'; return; }
+
+  let html = `<div class="muted" style="margin-bottom:8px;font-size:12px">${list.length} driver${list.length === 1 ? '' : 's'} · ${_driverRecordsAll.length} settlement${_driverRecordsAll.length === 1 ? '' : 's'} total</div>`;
+  html += '<table><thead><tr><th>Driver</th><th class="right">Settlements</th><th>Latest</th><th class="right">Total Net &#8377;</th><th></th></tr></thead><tbody>';
+  list.forEach(d => {
+    const latestDate = d.latest ? (d.latest['Date'] || '—') : '—';
+    const latestStatus = d.latest ? statusBadge(d.latest['Status']) : '';
+    html += `<tr style="cursor:pointer" onclick="openDriverFolder('${escapeHtmlSimple(d.id)}')">
+      <td><strong>${escapeHtmlSimple(d.name || '(unnamed)')}</strong> <span class="muted">${escapeHtmlSimple(d.id)}</span></td>
+      <td class="right num">${d.count}</td>
+      <td>${escapeHtmlSimple(latestDate)} ${latestStatus}</td>
+      <td class="right num">${fmt(d.totalNet)}</td>
+      <td><button class="secondary small" type="button" onclick="event.stopPropagation();openDriverFolder('${escapeHtmlSimple(d.id)}')">Open folder</button></td>
+    </tr>`;
+  });
+  html += '</tbody></table>';
+  c.innerHTML = html;
+}
+
+function openDriverFolder(driverId) {
+  const c = $('driver-records-content');
+  const list = _driverRecordsAll
+    .filter(r => String(r['Driver ID'] || '') === driverId)
+    .sort((a, b) => String(b['Date'] || '').localeCompare(String(a['Date'] || '')));
+  const name = list[0] ? (list[0]['Driver Name'] || '') : '';
+  const totalNet = list.reduce((s, r) => s + (Number(r['Net Payable']) || 0), 0);
+
+  let html = `<button class="secondary small" type="button" onclick="renderDriverFolderList(($('driver-records-search')||{}).value||'')">&larr; Back to all drivers</button>
+    <h3 style="margin:12px 0 4px">📁 ${escapeHtmlSimple(name || '(unnamed)')} <span class="muted">${escapeHtmlSimple(driverId)}</span></h3>
+    <div class="muted" style="margin-bottom:10px;font-size:12px">${list.length} settlement${list.length === 1 ? '' : 's'} · Total Net &#8377;${fmtNum(totalNet)}</div>`;
+
+  if (!list.length) {
+    html += '<div class="muted">No settlements for this driver.</div>';
+  } else {
+    html += '<table><thead><tr><th>Settlement ID</th><th>Date</th><th>Period</th><th class="right">Net &#8377;</th><th>Status</th><th></th></tr></thead><tbody>';
+    list.forEach(r => {
+      html += `<tr>
+        <td>${escapeHtmlSimple(r._id || '')}</td>
+        <td>${escapeHtmlSimple(r['Date'] || '')}</td>
+        <td>${escapeHtmlSimple((r['Period From'] || '') + ' → ' + (r['Period To'] || ''))}</td>
+        <td class="right num">${fmt(Number(r['Net Payable']) || 0)}</td>
+        <td>${statusBadge(r['Status'])}</td>
+        <td style="white-space:nowrap">
+          <button class="secondary small" type="button" onclick="openRecordFromFolder('${r._id}')">Open</button>
+          <button class="secondary small" type="button" onclick="downloadRecordPdf('${r._id}')" title="Download PDF">📄 PDF</button>
+        </td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+  }
+  c.innerHTML = html;
+}
+
+// Open a record from the Folders modal — closes Folders, opens main Records modal, then the record.
+function openRecordFromFolder(id) {
+  closeDriverRecordsModal();
+  $('records-overlay').style.display = 'flex';
+  openRecord(id);
+}
+
+window.openDriverRecordsModal = openDriverRecordsModal;
+window.closeDriverRecordsModal = closeDriverRecordsModal;
+window.openDriverFolder = openDriverFolder;
+window.renderDriverFolderList = renderDriverFolderList;
+window.openRecordFromFolder = openRecordFromFolder;
+
 function loadStore(k, fallback) {
   try { return JSON.parse(localStorage.getItem(k)) ?? fallback; } catch { return fallback; }
 }
@@ -1243,6 +1448,7 @@ if (FIREBASE_READY) {
   fbAuth.onAuthStateChanged(async (u) => {
     if (!u) {
       stopRoutesSync();
+      stopSettledIndexSync();
       Object.assign(currentUser, { uid: null, email: null, name: null, role: null });
       applyRoleGating();
       showLogin();
@@ -1260,6 +1466,7 @@ if (FIREBASE_READY) {
       hideLogin();
       applyRoleGating();
       startRoutesSync();
+      startSettledIndexSync();
     } catch (err) {
       console.error('Profile load failed:', err);
       showLogin('Failed to load profile: ' + (err.message || err));
@@ -1356,7 +1563,14 @@ async function connectAndLoad() {
       cash,
     };
     state.vehicleClass = buildVehicleClass(allVehicle);
-    state.settledIndex = (settledRes && settledRes.settled) || {};
+    // Coerce whatever the Apps Script proxy returns into the new {trips, advancePeriods}
+    // shape. The legacy proxy returns a flat {tripNo: meta} map; period-based advance
+    // locks rely on Firestore mode (proxy mode falls back to "no advance lock").
+    const rawSettled = (settledRes && settledRes.settled) || {};
+    const rawTrips = (rawSettled && rawSettled.trips) ? rawSettled.trips : rawSettled;
+    const normalizedTrips = {};
+    Object.keys(rawTrips || {}).forEach(k => { normalizedTrips[tripIdKey(k)] = rawTrips[k]; });
+    state.settledIndex = { trips: normalizedTrips, advancePeriods: (rawSettled && rawSettled.advancePeriods) || {} };
 
     const cfg = ping.configured;
     const cfgPills = Object.entries(cfg)
@@ -1369,7 +1583,7 @@ async function connectAndLoad() {
         Money Advance: <strong>${advances.length}</strong> · UPI: <strong>${upi.length}</strong> · Cash: <strong>${cash.length}</strong> &nbsp;·&nbsp;
         Driver Details: <strong>${driverDetails.length}</strong> &nbsp;·&nbsp;
         Vehicles classified: <strong>${Object.keys(state.vehicleClass).length}</strong> &nbsp;·&nbsp;
-        Settled trips on file: <strong>${Object.keys(state.settledIndex).length}</strong>
+        Settled trips on file: <strong>${Object.keys((state.settledIndex && state.settledIndex.trips) || {}).length}</strong>
       </div>
     `;
     $('to-step-1').disabled = false;
@@ -1436,7 +1650,18 @@ function loadWorkbook(file) {
       const wb = XLSX.read(e.target.result, { type: 'array' });
       state.workbook = wb;
       state.mode = 'xlsx';
-      state.settledIndex = loadStore(STORAGE.settledIndex, {});
+      // When signed in, state.settledIndex is owned by the live Firestore listener
+      // (startSettledIndexSync) — DO NOT overwrite it here, or every workbook upload
+      // would wipe out all historical locks until the next change-event refire.
+      // Only fall back to the legacy localStorage index when Firestore is not
+      // available (offline / unconfigured).
+      if (!(FIREBASE_READY && currentUser && currentUser.uid)) {
+        const legacy = loadStore(STORAGE.settledIndex, {});
+        const legacyTrips = (legacy && legacy.trips) ? legacy.trips : (legacy || {});
+        const normalizedTrips = {};
+        Object.keys(legacyTrips || {}).forEach(k => { normalizedTrips[tripIdKey(k)] = legacyTrips[k]; });
+        state.settledIndex = { trips: normalizedTrips, advancePeriods: (legacy && legacy.advancePeriods) || {} };
+      }
       state.sheets = {
         dispatch: readSheet(wb, findSheet(wb, 'dispatch')),
         driverDetails: readSheet(wb, findSheet(wb, 'driver detail')),
@@ -1635,6 +1860,20 @@ function parseCashType(remark, toLocation) {
   return 'Trip Advance';
 }
 
+// Composite key used to lock an advance row from re-inclusion in a future
+// settlement. Driver-scoped so the same ₹500 UPI on the same day for two
+// different drivers does not collide. The same key shape is computed at parse
+// time (state.advances[i].rowKey) and at submit time (persisted as 'Row Key'
+// in the Firestore advance row) so loading the index matches the wizard's view.
+function advanceRowKey(driverId, date, mode, amount, remark) {
+  const id = String(driverId || '').trim().toUpperCase();
+  const d = String(date || '').trim();
+  const m = String(mode || '').trim();
+  const amt = Math.round(Number(amount) || 0);
+  const r = String(remark || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  return `${id}|${d}|${m}|${amt}|${r}`;
+}
+
 // Pulls advances for the current driver from all three channels:
 //   MONEY ADVANCE SHEET → Account (NetBanking transfers, REMARK 1 encodes type+driver)
 //   UPI SHEET           → UPI     (Tally vouchers; PARTICULARS encodes the driver)
@@ -1656,7 +1895,7 @@ function fetchAdvancesForDriver() {
     if (!amount) continue;
     const type = normalizePaymentType(parsed.type || getCol(row, 'payment\\s*type', '^type$'));
     const remark = String(getCol(row, 'purpose', 'reason', 'remark\\s*3', 'remark\\s*2') || '').trim();
-    out.push({ amount, date: d, mode: 'Account', type, remark, removed: false, manual: false });
+    out.push({ amount, date: d, mode: 'Account', type, remark, rowKey: advanceRowKey(myId, d, 'Account', amount, remark), removed: false, manual: false });
   }
 
   for (const row of state.sheets.upi || []) {
@@ -1673,7 +1912,7 @@ function fetchAdvancesForDriver() {
     const amount = Number(getCol(row, 'gross\\s*type')) || 0;
     if (!amount) continue;
     const remark = String(getCol(row, 'voucher\\s*no', 'particulars') || '').trim();
-    out.push({ amount, date: d, mode: 'UPI', type: 'Trip Advance', remark, removed: false, manual: false });
+    out.push({ amount, date: d, mode: 'UPI', type: 'Trip Advance', remark, rowKey: advanceRowKey(myId, d, 'UPI', amount, remark), removed: false, manual: false });
   }
 
   for (const row of state.sheets.cash || []) {
@@ -1689,7 +1928,7 @@ function fetchAdvancesForDriver() {
     if (!amount) continue;
     const remark = String(getCol(row, 'remark', 'to\\s*location') || '').trim();
     const type = parseCashType(getCol(row, 'remark'), getCol(row, 'to\\s*location'));
-    out.push({ amount, date: d, mode: 'Cash', type, remark, removed: false, manual: false });
+    out.push({ amount, date: d, mode: 'Cash', type, remark, rowKey: advanceRowKey(myId, d, 'Cash', amount, remark), removed: false, manual: false });
   }
 
   return out;
@@ -1752,7 +1991,7 @@ function attendanceForDate(driverId, date) {
 
 function detectAnomalies(trip) {
   const flags = [];
-  if (state.settledIndex[trip.tripNo]) flags.push('Already settled');
+  if (state.settledIndex && state.settledIndex.trips && state.settledIndex.trips[tripIdKey(trip.tripNo)]) flags.push('Already settled');
   if ((trip.status || '').toLowerCase() === 'closed' && !trip.freight) flags.push('Missing freight');
   if (trip.totalKm === 0 && trip.from && trip.to && trip.from !== trip.to) flags.push('Missing KM');
   if (trip.totalKm > CONFIG.kmHigh) flags.push(`KM looks wrong (${fmtNum(trip.totalKm)})`);
@@ -1798,22 +2037,36 @@ function renderTrips() {
     c.innerHTML = `<div class="warn-box">No trips found for ${state.driver.name} between ${state.periodFrom} and ${state.periodTo}. You can still proceed to record advances + incentive/penalty.</div>`;
     return;
   }
+  const lockedTripIdx = state.settledIndex && state.settledIndex.trips ? state.settledIndex.trips : {};
+  // Force-remove any locked trip and sort locked trips to the bottom so the
+  // selectable rows stay at the top of the list.
+  const order = state.trips.map((t, i) => ({ t, i, locked: !!lockedTripIdx[tripIdKey(t.tripNo)] }));
+  order.forEach(o => { if (o.locked) o.t.removed = true; });
+  order.sort((a, b) => (a.locked === b.locked) ? 0 : (a.locked ? 1 : -1));
   let html = `<table><thead><tr><th style="width:28px"></th><th>#</th><th>Date</th><th>Trip No</th><th>Vehicle</th><th>Route</th><th class="right">Freight</th><th>Flags</th><th></th></tr></thead><tbody>`;
-  state.trips.forEach((t, i) => {
+  order.forEach(({ t, i, locked }, displayIdx) => {
     const flags = detectAnomalies(t);
     const flagHtml = flags.map(f => `<span class="badge warn">${f}</span>`).join(' ') || '<span class="badge ok">ok</span>';
     const isOpen = !!t.expanded;
     const chevron = isOpen ? '▾' : '▸';
-    html += `<tr class="${t.removed ? 'removed' : ''}" style="cursor:pointer" onclick="toggleExpandTrip(event, ${i})">
+    const lockMeta = locked ? lockedTripIdx[tripIdKey(t.tripNo)] : null;
+    const lockBadge = lockMeta
+      ? ` <span class="badge muted" title="Already included in settlement ${escapeHtmlSimple(lockMeta.settlementId)} on ${escapeHtmlSimple(lockMeta.settledOn)}">🔒 Settled in ${escapeHtmlSimple(lockMeta.settlementId)}</span>`
+      : '';
+    const removeBtn = locked
+      ? `<button class="secondary small" disabled style="cursor:not-allowed;opacity:0.6" title="This trip is locked because it was already settled.">Locked</button>`
+      : `<button class="${t.removed ? '' : 'danger'} small" onclick="event.stopPropagation();toggleRemoveTrip(${i})">${t.removed ? 'Restore' : 'Remove'}</button>`;
+    const rowClass = locked ? 'removed muted' : (t.removed ? 'removed' : '');
+    html += `<tr class="${rowClass}" style="cursor:pointer" onclick="toggleExpandTrip(event, ${i})">
       <td style="text-align:center;color:var(--muted)">${chevron}</td>
-      <td>${i + 1}</td>
+      <td>${displayIdx + 1}</td>
       <td>${t.tripStart}</td>
-      <td>${t.tripNo}${t.manual ? ' <span class="badge muted">manual</span>' : ''}</td>
+      <td>${t.tripNo}${t.manual ? ' <span class="badge muted">manual</span>' : ''}${lockBadge}</td>
       <td>${t.vehicle}</td>
       <td>${t.from} → ${t.to}<br><span class="muted">${t.item}</span></td>
       <td class="right num">${fmt(t.freight)}</td>
       <td>${flagHtml}</td>
-      <td><button class="${t.removed ? '' : 'danger'} small" onclick="event.stopPropagation();toggleRemoveTrip(${i})">${t.removed ? 'Restore' : 'Remove'}</button></td>
+      <td>${removeBtn}</td>
     </tr>`;
     if (isOpen) {
       const wtLoss = t.loadingWeight > 0 ? ((t.loadingWeight - t.unloadingWeight) / t.loadingWeight * 100).toFixed(1) + '%' : '—';
@@ -1870,9 +2123,10 @@ window.addManualTrip = () => {
 
 $('to-step-4').addEventListener('click', () => {
   // block if any trip is already settled (and not removed)
-  const blocked = state.trips.filter(t => !t.removed && state.settledIndex[t.tripNo]);
+  const trips = (state.settledIndex && state.settledIndex.trips) || {};
+  const blocked = state.trips.filter(t => !t.removed && trips[tripIdKey(t.tripNo)]);
   if (blocked.length > 0) {
-    alert(`Cannot proceed — these trips are already settled: ${blocked.map(t => t.tripNo).join(', ')}. Remove them or reset the settled index.`);
+    alert(`Cannot proceed — these trips are already settled: ${blocked.map(t => t.tripNo).join(', ')}. They are locked and cannot be re-included.`);
     return;
   }
   renderAdvances();
@@ -1886,20 +2140,36 @@ function renderAdvances() {
     c.innerHTML = `<div class="warn-box">No advances on file for this period. Add manually if needed.</div>`;
     return;
   }
+  // Period-based lock: any advance whose date falls inside a settled period for
+  // this driver is locked, regardless of remark/voucher/amount drift between
+  // workbook re-uploads.
+  const order = state.advances.map((a, i) => {
+    const lockMeta = findAdvanceLock(a);
+    return { a, i, locked: !!lockMeta, lockMeta };
+  });
+  order.forEach(o => { if (o.locked) o.a.removed = true; });
+  order.sort((x, y) => (x.locked === y.locked) ? 0 : (x.locked ? 1 : -1));
   const skipped = state.advances.filter(a => !a.removed && !isDeductibleAdvance(a))
                                  .reduce((s, a) => s + a.amount, 0);
   let html = `<table><thead><tr><th>Date</th><th>Type</th><th>Mode</th><th class="right">Amount</th><th>Remark</th><th></th></tr></thead><tbody>`;
-  state.advances.forEach((a, i) => {
+  order.forEach(({ a, i, locked, lockMeta }) => {
     const ded = isDeductibleAdvance(a);
     const typeLabel = a.type || (a.manual ? 'Manual' : '(none)');
     const typeBadge = `<span class="badge ${ded ? 'ok' : 'muted'}">${typeLabel}${ded ? '' : ' — not deducted'}</span>`;
-    html += `<tr class="${a.removed ? 'removed' : ''}">
+    const lockBadge = lockMeta
+      ? ` <span class="badge muted" title="Already covered by settlement ${escapeHtmlSimple(lockMeta.settlementId)} (period ${escapeHtmlSimple(lockMeta.from)} → ${escapeHtmlSimple(lockMeta.to)})">🔒 Settled in ${escapeHtmlSimple(lockMeta.settlementId)}</span>`
+      : '';
+    const removeBtn = locked
+      ? `<button class="secondary small" disabled style="cursor:not-allowed;opacity:0.6" title="This advance's date falls in a period already settled for this driver.">Locked</button>`
+      : `<button class="${a.removed ? '' : 'danger'} small" onclick="toggleRemoveAdv(${i})">${a.removed ? 'Restore' : 'Remove'}</button>`;
+    const rowClass = locked ? 'removed muted' : (a.removed ? 'removed' : '');
+    html += `<tr class="${rowClass}">
       <td>${a.date}</td>
       <td>${typeBadge}</td>
       <td><span class="badge ${a.mode === 'Cash' ? 'warn' : 'ok'}">${a.mode}</span></td>
       <td class="right num">${fmt(a.amount)}</td>
-      <td>${a.remark || ''}${a.manual ? ' <span class="badge muted">manual</span>' : ''}</td>
-      <td><button class="${a.removed ? '' : 'danger'} small" onclick="toggleRemoveAdv(${i})">${a.removed ? 'Restore' : 'Remove'}</button></td>
+      <td>${a.remark || ''}${a.manual ? ' <span class="badge muted">manual</span>' : ''}${lockBadge}</td>
+      <td>${removeBtn}</td>
     </tr>`;
   });
   html += '</tbody></table>';
@@ -1918,7 +2188,8 @@ window.addManualAdvance = () => {
   const remark = $('man-adv-remark').value.trim();
   if (!amount || amount <= 0) { alert('Amount must be > 0'); return; }
   if (!date) { alert('Date required'); return; }
-  state.advances.push({ amount, date, mode, remark, removed: false, manual: true });
+  const rowKey = advanceRowKey(state.driver && state.driver.id, date, mode, amount, remark);
+  state.advances.push({ amount, date, mode, remark, rowKey, removed: false, manual: true });
   ['man-adv-amount','man-adv-date','man-adv-remark'].forEach(id => $(id).value = '');
   renderAdvances();
 };
@@ -1930,6 +2201,14 @@ $('to-step-5').addEventListener('click', () => {
       alert(`Advance on ${a.date} has invalid mode "${a.mode}". Must be Cash, UPI, or Account.`);
       return;
     }
+  }
+  // Block if any advance falls within a period already settled for this driver
+  // (defense in depth — the UI already forces locked rows to removed:true and
+  // disables the restore button, but a tampered state could otherwise sneak through).
+  const blockedAdv = state.advances.filter(a => !a.removed && findAdvanceLock(a));
+  if (blockedAdv.length > 0) {
+    alert(`Cannot proceed — these advances fall in a period already settled for this driver: ${blockedAdv.map(a => `${a.date} ${a.mode} ${fmt(a.amount)}`).join(', ')}. They are locked and cannot be re-included.`);
+    return;
   }
   buildTripInputs();
   renderTripLoop();
@@ -2519,20 +2798,36 @@ function buildSettlementPayload(sId, finalizedOn) {
   }));
 
   // Full per-advance detail (every advance considered, flagged whether it was deducted).
-  const advanceRows = state.advances.filter(a => !a.removed).map(a => ({
-    'Settlement ID': sId,
-    'Settlement Date': finalizedOn,
-    'Driver ID': state.driver.id,
-    'Driver Name': state.driver.name,
-    'Advance Date': a.date || '',
-    'Mode': a.mode,
-    'Type': a.type || '',
-    'Amount': a.amount,
-    'Deducted': isDeductibleAdvance(a) ? 'Yes' : 'No',
-    'Remark': a.remark || '',
+  // 'Row Key' is the same driver-scoped composite the wizard uses to lock an advance
+  // from re-inclusion; storing it on the doc lets future settlements rebuild the lock
+  // index without recomputing from individual fields.
+  const advanceRows = state.advances.filter(a => !a.removed).map(a => {
+    const rk = a.rowKey || advanceRowKey(state.driver.id, a.date, a.mode, a.amount, a.remark);
+    return {
+      'Settlement ID': sId,
+      'Settlement Date': finalizedOn,
+      'Driver ID': state.driver.id,
+      'Driver Name': state.driver.name,
+      'Advance Date': a.date || '',
+      'Mode': a.mode,
+      'Type': a.type || '',
+      'Amount': a.amount,
+      'Deducted': isDeductibleAdvance(a) ? 'Yes' : 'No',
+      'Remark': a.remark || '',
+      'Row Key': rk,
+    };
+  });
+
+  // Persisted 'Row Key' column on each advance row stays as audit data, but the
+  // lock mechanism no longer reads it — advances are locked by period overlap.
+  const settledAdvanceKeys = advanceRows.map(r => ({
+    rowKey: r['Row Key'],
+    driverId: r['Driver ID'],
+    settlementId: r['Settlement ID'],
+    settledOn: r['Settlement Date'],
   }));
 
-  return { driverLogRows, summaryRow, truckLogRows, settledIndexRows, advanceRows, byVehicle, trips };
+  return { driverLogRows, summaryRow, truckLogRows, settledIndexRows, settledAdvanceKeys, advanceRows, byVehicle, trips };
 }
 
 async function finalize() {
@@ -2554,6 +2849,16 @@ async function finalize() {
       btn.disabled = false; btn.textContent = original; return;
     }
 
+    // Final clash recheck — if another user submitted between Step-4 and now, the
+    // live snapshot will have updated the index and we must abort before writing.
+    const lockTrips = (state.settledIndex && state.settledIndex.trips) || {};
+    const tripClash = payload.settledIndexRows.find(r => lockTrips[tripIdKey(r['Trip No'])]);
+    const advClash = state.advances.find(a => !a.removed && findAdvanceLock(a));
+    if (tripClash || advClash) {
+      alert('Another user just settled overlapping items. Please refresh the page and rebuild this settlement.');
+      btn.disabled = false; btn.textContent = original; return;
+    }
+
     // Compose a single Firestore document per settlement — trips + advances + truck-log embedded.
     const docData = Object.assign({}, payload.summaryRow, {
       trips: payload.driverLogRows,
@@ -2565,12 +2870,20 @@ async function finalize() {
     });
     await fbDb.collection('settlements').doc(sId).set(docData);
 
-    // In-session settled-trips index so the same trips can't be re-settled in another wizard run.
-    const idx = state.settledIndex || {};
+    // In-session settled index so the same trips + advances can't be re-settled in
+    // another wizard run before the live snapshot round-trips back.
+    const tripsIdx = (state.settledIndex && state.settledIndex.trips) || {};
+    const periodsIdx = (state.settledIndex && state.settledIndex.advancePeriods) || {};
     payload.settledIndexRows.forEach(r => {
-      idx[r['Trip No']] = { driverId: r['Driver ID'], settlementId: r['Settlement ID'], settledOn: r['Settled On'] };
+      const tn = tripIdKey(r['Trip No']);
+      if (tn) tripsIdx[tn] = { driverId: r['Driver ID'], settlementId: r['Settlement ID'], settledOn: r['Settled On'] };
     });
-    state.settledIndex = idx;
+    const did = String(state.driver.id || '').trim().toUpperCase();
+    if (did && state.periodFrom && state.periodTo) {
+      if (!periodsIdx[did]) periodsIdx[did] = [];
+      periodsIdx[did].push({ from: state.periodFrom, to: state.periodTo, settlementId: sId, settledOn: finalizedOn });
+    }
+    state.settledIndex = { trips: tripsIdx, advancePeriods: periodsIdx };
 
     state.result.settlementId = sId;
     state.result.finalizedOn = finalizedOn;
@@ -2930,7 +3243,7 @@ function exportTruckLog() {
   downloadXlsx(rows, 'Truck Log', `Truck_Settlement_Log_${today().replace(/-/g, '')}.xlsx`);
 }
 function exportSettledIndex() {
-  const idx = loadStore(STORAGE.settledIndex, {});
+  const idx = (state.settledIndex && state.settledIndex.trips) ? state.settledIndex.trips : {};
   const rows = Object.entries(idx).map(([tripNo, v]) => ({ 'Trip No': tripNo, 'Driver ID': v.driverId, 'Settlement ID': v.settlementId, 'Settled On': v.settledOn }));
   if (rows.length === 0) { alert('Settled index is empty.'); return; }
   downloadXlsx(rows, 'Settled Trips', `Settled_Trips_Index_${today().replace(/-/g, '')}.xlsx`);
