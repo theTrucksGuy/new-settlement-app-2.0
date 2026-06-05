@@ -275,7 +275,7 @@
 
     <div class="tabs" id="source-tabs">
       <div class="tab active" data-pane="sheets">Google Sheets</div>
-      <div class="tab" data-pane="xlsx">Upload XLSX (fallback)</div>
+      <div class="tab" data-pane="xlsx">Workbook (auto-fetch or upload)</div>
     </div>
 
     <!-- Google Sheets pane -->
@@ -291,14 +291,33 @@
       <div id="proxy-summary" style="margin-top:8px"></div>
     </div>
 
-    <!-- XLSX pane -->
+    <!-- XLSX pane — two equal-weight panels: fetch (left) and upload (right) -->
     <div class="tab-pane" data-pane="xlsx">
-      <p class="muted">Drop in <code>Fleet_Operations_Master_Final.xlsx</code> (or click to choose). Reads Dispatch, Attendance, Routes, Repair Sheet, and Money Advance.</p>
-      <div class="file-drop" id="file-drop">
-        <input type="file" id="file-input" accept=".xlsx,.xls" style="display:none" />
-        <div id="file-drop-text">
-          <strong>Click or drop XLSX here</strong>
-          <div class="muted" style="margin-top:6px">No file chosen yet</div>
+      <p class="muted">Auto-fetch a Google Sheets published workbook, or upload an <code>.xlsx</code> directly. Either way reads Dispatch, Driver Details, Money Advance, UPI Sheet, Cash Sheet, and All Vehicle.</p>
+      <div class="grid-2" style="gap:14px;align-items:stretch">
+        <!-- Fetch panel (left) -->
+        <div style="background:var(--panel-2);border:1px solid var(--border);border-radius:10px;padding:14px;display:flex;flex-direction:column">
+          <h3 style="margin:0 0 6px 0;color:var(--text);text-transform:none;letter-spacing:0;font-size:14px">📡 Fetch from Google Sheets</h3>
+          <p class="muted" style="margin:0 0 8px 0;font-size:12px">Paste the <strong>Publish to web</strong> URL of the master workbook (any <code>output=</code> variant — we swap to <code>xlsx</code> automatically so all sheets come through in one fetch).</p>
+          <label style="margin-top:4px">Published URL</label>
+          <input type="text" id="fetch-url" placeholder="https://docs.google.com/spreadsheets/d/e/.../pub?output=csv" autocomplete="off" />
+          <div class="actions" style="justify-content:flex-start;margin-top:10px">
+            <button id="fetch-load-btn" type="button">Fetch &amp; load</button>
+            <button class="secondary small" id="fetch-clear-btn" type="button" title="Clear the saved URL">✕ Clear</button>
+          </div>
+          <div id="fetch-status" class="muted" style="margin-top:10px;font-size:12px"></div>
+        </div>
+        <!-- Upload panel (right) -->
+        <div style="background:var(--panel-2);border:1px solid var(--border);border-radius:10px;padding:14px;display:flex;flex-direction:column">
+          <h3 style="margin:0 0 6px 0;color:var(--text);text-transform:none;letter-spacing:0;font-size:14px">📁 Upload workbook file</h3>
+          <p class="muted" style="margin:0 0 10px 0;font-size:12px">Drop a downloaded copy of the master workbook (or click to choose).</p>
+          <div class="file-drop" id="file-drop" style="flex:1;display:flex;flex-direction:column;justify-content:center">
+            <input type="file" id="file-input" accept=".xlsx,.xls" style="display:none" />
+            <div id="file-drop-text">
+              <strong>Click or drop XLSX here</strong>
+              <div class="muted" style="margin-top:6px">No file chosen yet</div>
+            </div>
+          </div>
         </div>
       </div>
       <div id="sheet-summary" style="margin-top:16px; display:none"></div>
@@ -516,6 +535,7 @@ const STORAGE = {
   settledIndex: 'grubus_settled_trips_index',
   driverLastSettlement: 'grubus_driver_last_settlement',
   proxyUrl: 'grubus_proxy_url',
+  fetchUrl: 'grubus_fetch_url',
 };
 
 const CONFIG = {
@@ -542,11 +562,14 @@ const state = {
   sheets: {},
   // Settled-from-prior-settlements lock index. Loaded from Firestore on sign-in and
   // kept in sync via onSnapshot so locks lift the moment a settlement is deleted.
-  //   trips           — { [normalizedTripNo]: meta }
-  //   advancePeriods  — { [driverIdUpper]: [{from, to, settlementId, settledOn}, ...] }
-  //                     period-based: any advance dated within a settled period for
-  //                     that driver is locked, regardless of upload row contents.
-  settledIndex: { trips: {}, advancePeriods: {} },
+  //   trips             — { [normalizedTripNo]: meta }
+  //   deductedAdvances  — { [stableAdvanceKey]: { settlementId, settledOn, driverId } }
+  //                       per-advance lock: locks ONLY the specific advance rows that
+  //                       were actually deducted in some settlement (not the whole
+  //                       date window the settlement covered). An advance removed from
+  //                       a settlement stays unlocked and surfaces as a carry-over row
+  //                       in the next wizard for the same driver.
+  settledIndex: { trips: {}, deductedAdvances: {} },
   driver: null,
   periodFrom: null,
   periodTo: null,
@@ -626,13 +649,14 @@ function stopRoutesSync() {
 
 // ---------- Settled-trip / settled-advance lock index (live from Firestore) ----------
 // Listens to every settlement doc and rebuilds state.settledIndex.
-//   trips           — keyed by normalized Trip No (trim + uppercase) so case/whitespace
-//                     drift between workbook uploads cannot unlock a settled trip.
-//   advancePeriods  — { [driverIdUpper]: [{from, to, settlementId, settledOn}, ...] }
-//                     period-based locking: an advance is locked if its date falls
-//                     within ANY settled period for that driver. Survives re-uploads
-//                     because it does not depend on row content (remark, voucher,
-//                     amount rounding, etc.).
+//   trips             — keyed by normalized Trip No (trim + uppercase) so case/whitespace
+//                       drift between workbook uploads cannot unlock a settled trip.
+//   deductedAdvances  — { [stableRowKey]: { settlementId, settledOn, driverId } }
+//                       Per-advance lock: every row in a settlement's `advances[]`
+//                       array is keyed by its persisted `Row Key`. Only those exact
+//                       rows are locked — an advance the admin removed from a
+//                       settlement is NOT in any settlement's array, so it stays
+//                       unlocked and resurfaces as a carry-over candidate.
 // onSnapshot means:
 //   - User A submits a settlement on Browser 1 → User B's wizard on Browser 2 sees
 //     those trips/advances locked within ~1 s, no reload required.
@@ -642,7 +666,7 @@ function startSettledIndexSync() {
   if (!FIREBASE_READY || !currentUser.uid || _settledIndexUnsubscribe) return;
   _settledIndexUnsubscribe = fbDb.collection('settlements').onSnapshot(snap => {
     const trips = {};
-    const advancePeriods = {};
+    const deductedAdvances = {};
     snap.forEach(doc => {
       const d = doc.data() || {};
       if (d['Status'] === 'Cancelled') return; // forward-compat; no such status today
@@ -655,14 +679,31 @@ function startSettledIndexSync() {
         const tn = tripIdKey(row && row['Trip No']);
         if (tn) trips[tn] = meta;
       });
-      const from = d['Period From'] || '';
-      const to = d['Period To'] || '';
-      if (driverId && from && to) {
-        if (!advancePeriods[driverId]) advancePeriods[driverId] = [];
-        advancePeriods[driverId].push({ from, to, settlementId: sId, settledOn });
-      }
+      // Per-advance lock derivation. Two cases:
+      //   - NEW format `Row Key` (ends with an integer position) → trust as-is.
+      //   - OLD format `Row Key` ('...|remark') or missing → re-derive a stable
+      //     key from the row's own fields, grouping within THIS doc's advances[]
+      //     by (Driver ID, Advance Date, Mode, Amount) so positions line up with
+      //     what a fresh wizard fetch would produce from the source sheet.
+      const docCounter = new Map();
+      (d.advances || []).forEach(row => {
+        if (!row) return;
+        const persistedRk = row['Row Key'];
+        if (persistedRk && /\|\d+$/.test(persistedRk)) {
+          deductedAdvances[persistedRk] = meta;
+          return;
+        }
+        const driverId = String(row['Driver ID'] || d['Driver ID'] || '').trim().toUpperCase();
+        const date = String(row['Advance Date'] || '').trim();
+        const mode = String(row['Mode'] || '').trim();
+        const amount = Math.round(Number(row['Amount']) || 0);
+        if (!driverId || !date || !mode || !amount) return;
+        const position = nextPositionFor(docCounter, date, mode, amount);
+        const derivedKey = advanceRowKey(driverId, date, mode, amount, position);
+        deductedAdvances[derivedKey] = meta;
+      });
     });
-    state.settledIndex = { trips, advancePeriods };
+    state.settledIndex = { trips, deductedAdvances };
     // Re-render any open wizard tables so locks appear immediately on changes
     // from another browser.
     try { if ($('trips-container') && $('trips-container').innerHTML) renderTrips(); } catch (_) {}
@@ -671,7 +712,7 @@ function startSettledIndexSync() {
 }
 function stopSettledIndexSync() {
   if (_settledIndexUnsubscribe) { _settledIndexUnsubscribe(); _settledIndexUnsubscribe = null; }
-  state.settledIndex = { trips: {}, advancePeriods: {} };
+  state.settledIndex = { trips: {}, deductedAdvances: {} };
 }
 
 // Normalize a Trip No for lock-index lookups — trim and uppercase so cosmetic
@@ -679,19 +720,12 @@ function stopSettledIndexSync() {
 // cannot accidentally unlock a settled trip.
 function tripIdKey(tn) { return String(tn == null ? '' : tn).trim().toUpperCase(); }
 
-// Returns the settled-period meta that locks this advance for the current driver,
-// or null if no settled period covers its date. Period bounds match the wizard's
-// fetch filter (line: `d > periodFrom && d <= periodTo`), so back-to-back periods
-// using the previous periodTo as the next periodFrom do not double-lock.
+// Returns the settled-advance meta that locks this advance, or null if it has
+// not yet been deducted in any settlement. Flat lookup by the row's stable key.
 function findAdvanceLock(adv) {
-  if (!adv || !adv.date) return null;
-  const driverId = String((state.driver && state.driver.id) || '').trim().toUpperCase();
-  if (!driverId) return null;
-  const periods = (state.settledIndex && state.settledIndex.advancePeriods && state.settledIndex.advancePeriods[driverId]) || [];
-  for (const p of periods) {
-    if (p.from && p.to && adv.date > p.from && adv.date <= p.to) return p;
-  }
-  return null;
+  if (!adv || !adv.rowKey) return null;
+  const ded = state.settledIndex && state.settledIndex.deductedAdvances;
+  return (ded && ded[adv.rowKey]) || null;
 }
 
 function openRoutesModal() {
@@ -1569,14 +1603,14 @@ async function connectAndLoad() {
       cash,
     };
     state.vehicleClass = buildVehicleClass(allVehicle);
-    // Coerce whatever the Apps Script proxy returns into the new {trips, advancePeriods}
-    // shape. The legacy proxy returns a flat {tripNo: meta} map; period-based advance
-    // locks rely on Firestore mode (proxy mode falls back to "no advance lock").
+    // Coerce whatever the Apps Script proxy returns into the new {trips, deductedAdvances}
+    // shape. The legacy proxy returns a flat {tripNo: meta} map; per-advance locking
+    // relies on Firestore mode (proxy mode falls back to "no advance lock").
     const rawSettled = (settledRes && settledRes.settled) || {};
     const rawTrips = (rawSettled && rawSettled.trips) ? rawSettled.trips : rawSettled;
     const normalizedTrips = {};
     Object.keys(rawTrips || {}).forEach(k => { normalizedTrips[tripIdKey(k)] = rawTrips[k]; });
-    state.settledIndex = { trips: normalizedTrips, advancePeriods: (rawSettled && rawSettled.advancePeriods) || {} };
+    state.settledIndex = { trips: normalizedTrips, deductedAdvances: (rawSettled && rawSettled.deductedAdvances) || {} };
 
     const cfg = ping.configured;
     const cfgPills = Object.entries(cfg)
@@ -1646,6 +1680,45 @@ function readSheet(wb, name, opts) {
   return XLSX.utils.sheet_to_json(sh, Object.assign({ defval: '', raw: true }, opts || {}));
 }
 
+// Shared post-parse handler. Both the file-drop and the Google Sheets fetch
+// flow into this — keeps state.sheets / state.vehicleClass / state.settledIndex
+// coercion logic in one place.
+function processWorkbook(wb, sourceLabel) {
+  state.workbook = wb;
+  state.mode = 'xlsx';
+  // When signed in, state.settledIndex is owned by the live Firestore listener
+  // (startSettledIndexSync) — DO NOT overwrite it here, or every workbook load
+  // would wipe out all historical locks until the next change-event refire.
+  if (!(FIREBASE_READY && currentUser && currentUser.uid)) {
+    const legacy = loadStore(STORAGE.settledIndex, {});
+    const legacyTrips = (legacy && legacy.trips) ? legacy.trips : (legacy || {});
+    const normalizedTrips = {};
+    Object.keys(legacyTrips || {}).forEach(k => { normalizedTrips[tripIdKey(k)] = legacyTrips[k]; });
+    state.settledIndex = { trips: normalizedTrips, deductedAdvances: (legacy && legacy.deductedAdvances) || {} };
+  }
+  state.sheets = {
+    dispatch: readSheet(wb, findSheet(wb, 'dispatch')),
+    driverDetails: readSheet(wb, findSheet(wb, 'driver detail')),
+    attendance: [],
+    attendancePrev: [],
+    routes: [],
+    repairs: [],
+    // MONEY ADVANCE SHEET / UPI SHEET / CASH SHEET — all read with default header on row 1.
+    advances: readSheet(wb, findSheet(wb, 'money advance')),
+    upi: readSheet(wb, findSheet(wb, 'upi sheet')),
+    cash: readSheet(wb, findSheet(wb, 'cash sheet')),
+  };
+  state.vehicleClass = buildVehicleClass(readSheet(wb, findSheet(wb, 'all vehicle')));
+  const counts = Object.entries(state.sheets).map(([k,v]) => `${k}: <strong>${v.length}</strong>`).join(' &nbsp;·&nbsp; ');
+  const sheetList = wb.SheetNames.map(n => `<span class="badge muted">${n}</span>`).join(' ');
+  $('sheet-summary').style.display = 'block';
+  $('sheet-summary').innerHTML = `
+    <div class="info"><strong>Loaded.</strong> ${sourceLabel ? `<span class="muted">${escapeHtmlSimple(sourceLabel)}</span> &nbsp;·&nbsp; ` : ''}${counts}</div>
+    <div class="muted">Sheets in workbook: ${sheetList}</div>
+  `;
+  $('to-step-1').disabled = false;
+}
+
 function loadWorkbook(file) {
   const reader = new FileReader();
   reader.onload = (e) => {
@@ -1654,48 +1727,66 @@ function loadWorkbook(file) {
       // with exact integer math. cellDates produces Date objects that drift a few
       // seconds off midnight and land on the wrong calendar day.
       const wb = XLSX.read(e.target.result, { type: 'array' });
-      state.workbook = wb;
-      state.mode = 'xlsx';
-      // When signed in, state.settledIndex is owned by the live Firestore listener
-      // (startSettledIndexSync) — DO NOT overwrite it here, or every workbook upload
-      // would wipe out all historical locks until the next change-event refire.
-      // Only fall back to the legacy localStorage index when Firestore is not
-      // available (offline / unconfigured).
-      if (!(FIREBASE_READY && currentUser && currentUser.uid)) {
-        const legacy = loadStore(STORAGE.settledIndex, {});
-        const legacyTrips = (legacy && legacy.trips) ? legacy.trips : (legacy || {});
-        const normalizedTrips = {};
-        Object.keys(legacyTrips || {}).forEach(k => { normalizedTrips[tripIdKey(k)] = legacyTrips[k]; });
-        state.settledIndex = { trips: normalizedTrips, advancePeriods: (legacy && legacy.advancePeriods) || {} };
-      }
-      state.sheets = {
-        dispatch: readSheet(wb, findSheet(wb, 'dispatch')),
-        driverDetails: readSheet(wb, findSheet(wb, 'driver detail')),
-        attendance: [],
-        attendancePrev: [],
-        routes: [],
-        repairs: [],
-        // MONEY ADVANCE SHEET / UPI SHEET / CASH SHEET — all read with default header on row 1.
-        advances: readSheet(wb, findSheet(wb, 'money advance')),
-        upi: readSheet(wb, findSheet(wb, 'upi sheet')),
-        cash: readSheet(wb, findSheet(wb, 'cash sheet')),
-      };
-      state.vehicleClass = buildVehicleClass(readSheet(wb, findSheet(wb, 'all vehicle')));
-      const counts = Object.entries(state.sheets).map(([k,v]) => `${k}: <strong>${v.length}</strong>`).join(' &nbsp;·&nbsp; ');
-      const sheetList = wb.SheetNames.map(n => `<span class="badge muted">${n}</span>`).join(' ');
-      $('sheet-summary').style.display = 'block';
-      $('sheet-summary').innerHTML = `
-        <div class="info"><strong>Loaded.</strong> ${counts}</div>
-        <div class="muted">Sheets in workbook: ${sheetList}</div>
-      `;
+      processWorkbook(wb, file.name);
       $('file-drop').classList.add('has-file');
       $('file-drop-text').innerHTML = `<strong style="color:var(--ok)">✓ ${file.name}</strong><div class="muted">${(file.size/1024).toFixed(1)} KB</div>`;
-      $('to-step-1').disabled = false;
     } catch (err) {
       alert('Failed to read workbook: ' + err.message);
     }
   };
   reader.readAsArrayBuffer(file);
+}
+
+// Normalize a Google Sheets "Publish to web" URL to the multi-sheet XLSX
+// export. Users may paste any output variant (csv/tsv/xlsx) — we always want
+// xlsx so every sheet comes through in one fetch.
+function normalizePubUrl(raw) {
+  let url = String(raw || '').trim();
+  if (!url) return null;
+  if (/[?&]output=/i.test(url)) {
+    url = url.replace(/([?&])output=[^&]*/i, '$1output=xlsx');
+  } else {
+    url += (url.includes('?') ? '&' : '?') + 'output=xlsx';
+  }
+  return url;
+}
+
+async function fetchWorkbookFromUrl(rawUrl) {
+  const raw = String(rawUrl || '').trim();
+  if (!raw) { alert('Paste a published Google Sheets URL first.'); return; }
+  const url = normalizePubUrl(raw);
+  const statusEl = $('fetch-status');
+  const btn = $('fetch-load-btn');
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.innerHTML = '<span class="spinner"></span>Fetching…';
+  statusEl.innerHTML = '<span style="color:var(--muted)">Contacting Google Sheets…</span>';
+  try {
+    const t0 = Date.now();
+    const res = await fetch(url, { redirect: 'follow', cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + res.statusText);
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    // text/csv would indicate the doc is published as a single sheet only, not the
+    // full workbook — output=xlsx still returns the first sheet as CSV in that case.
+    if (ct.includes('text/csv') || ct.includes('text/plain')) {
+      throw new Error('Got a single-sheet CSV. The Google Sheet must be published as "Entire Document" (Publish to web → Entire Document) so output=xlsx returns the whole workbook.');
+    }
+    const buf = await res.arrayBuffer();
+    const wb = XLSX.read(buf, { type: 'array' });
+    const sizeMb = (buf.byteLength / 1024 / 1024).toFixed(2);
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    processWorkbook(wb, `Fetched · ${sizeMb} MB · ${secs} s`);
+    localStorage.setItem(STORAGE.fetchUrl, raw);
+    const ts = new Date();
+    const hh = String(ts.getHours()).padStart(2, '0');
+    const mm = String(ts.getMinutes()).padStart(2, '0');
+    const ss = String(ts.getSeconds()).padStart(2, '0');
+    statusEl.innerHTML = `<span style="color:var(--ok)">✓ Fetched at ${hh}:${mm}:${ss}</span> <span class="muted">· ${sizeMb} MB · ${secs} s · Google caches published exports for ~5 min, so very recent edits may not appear yet.</span>`;
+  } catch (err) {
+    statusEl.innerHTML = `<span style="color:var(--bad)">Fetch failed: ${escapeHtmlSimple(err.message || String(err))}</span>`;
+  } finally {
+    btn.disabled = false; btn.textContent = original;
+  }
 }
 
 $('file-drop').addEventListener('click', () => $('file-input').click());
@@ -1706,6 +1797,19 @@ $('file-drop').addEventListener('drop', e => {
 });
 $('file-input').addEventListener('change', e => {
   if (e.target.files[0]) loadWorkbook(e.target.files[0]);
+});
+
+// Auto-fetch URL wiring. Persist the last-used URL per browser so admins
+// don't paste it on every load.
+$('fetch-url').value = localStorage.getItem(STORAGE.fetchUrl) || '';
+$('fetch-load-btn').addEventListener('click', () => fetchWorkbookFromUrl($('fetch-url').value));
+$('fetch-url').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); fetchWorkbookFromUrl($('fetch-url').value); }
+});
+$('fetch-clear-btn').addEventListener('click', () => {
+  $('fetch-url').value = '';
+  localStorage.removeItem(STORAGE.fetchUrl);
+  $('fetch-status').innerHTML = '';
 });
 
 $('to-step-1').addEventListener('click', () => goStep(1));
@@ -1866,29 +1970,71 @@ function parseCashType(remark, toLocation) {
   return 'Trip Advance';
 }
 
-// Composite key used to lock an advance row from re-inclusion in a future
-// settlement. Driver-scoped so the same ₹500 UPI on the same day for two
-// different drivers does not collide. The same key shape is computed at parse
-// time (state.advances[i].rowKey) and at submit time (persisted as 'Row Key'
-// in the Firestore advance row) so loading the index matches the wizard's view.
-function advanceRowKey(driverId, date, mode, amount, remark) {
+// Stable composite key used to lock an advance row from re-inclusion in a
+// future settlement. Driver-scoped so the same ₹500 UPI on the same day for
+// two different drivers does not collide. Position is the 0-indexed order
+// within the (driver, date, mode, amount) group in source-sheet row order —
+// a tiebreaker for the rare case where the same driver has two identical
+// rows (e.g., two ₹500 Cash advances) on the same day. We deliberately do
+// NOT include the row's remark/voucher text because that drifts across
+// Excel/Google-Sheets exports and would unlock advances on every re-upload.
+function advanceRowKey(driverId, date, mode, amount, position) {
   const id = String(driverId || '').trim().toUpperCase();
   const d = String(date || '').trim();
   const m = String(mode || '').trim();
   const amt = Math.round(Number(amount) || 0);
-  const r = String(remark || '').trim().toLowerCase().replace(/\s+/g, ' ');
-  return `${id}|${d}|${m}|${amt}|${r}`;
+  const pos = Math.max(0, Number(position) || 0);
+  return `${id}|${d}|${m}|${amt}|${pos}`;
+}
+
+// Sequential position counter used while building advance lists — assigns
+// 0,1,2,... within each (date,mode,amount) group so advanceRowKey can break
+// ties between identical-looking rows.
+function nextPositionFor(counter, date, mode, amount) {
+  const k = `${date}|${mode}|${Math.round(Number(amount) || 0)}`;
+  const v = counter.get(k) || 0;
+  counter.set(k, v + 1);
+  return v;
 }
 
 // Pulls advances for the current driver from all three channels:
 //   MONEY ADVANCE SHEET → Account (NetBanking transfers, REMARK 1 encodes type+driver)
 //   UPI SHEET           → UPI     (Tally vouchers; PARTICULARS encodes the driver)
 //   CASH SHEET          → Cash    (REMARK encodes type; Driver ID col or name match)
+//
+// Returns rows tagged with `carryOver`:
+//   carryOver = false  →  rows dated in the current period (periodFrom, periodTo].
+//   carryOver = true   →  rows dated <= periodFrom whose stable key is NOT in
+//                         state.settledIndex.deductedAdvances. These are advances
+//                         the admin previously skipped (removed from an earlier
+//                         settlement) and must resurface until they are actually
+//                         deducted somewhere.
+// Future-dated rows (> periodTo) are excluded.
 function fetchAdvancesForDriver() {
   const out = [];
   const myId = String(state.driver.id || '').toUpperCase();
   const myName = String(state.driver.name || '').trim().toLowerCase();
-  const inPeriod = d => d && d > state.periodFrom && d <= state.periodTo;
+  const periodFrom = state.periodFrom;
+  const periodTo = state.periodTo;
+  const ded = (state.settledIndex && state.settledIndex.deductedAdvances) || {};
+
+  // Single iteration order over each sheet so position counters align with
+  // source-sheet order. Position is per (date,mode,amount) group across the
+  // ENTIRE driver-relevant set (both periods), not per period — that way a
+  // re-upload puts the carry-over row at the same position regardless of
+  // which period it lands in.
+  const counter = new Map();
+
+  // Decide whether a parsed row is in-period, carry-over, or out-of-range.
+  // Returns 'main' | 'carry' | null. We still compute the position counter for
+  // carry-over rows so that NEW current-period rows get positions consistent
+  // with what they would have had if the carry-over had been included.
+  const classify = (d) => {
+    if (!d) return null;
+    if (d > periodTo) return null;            // future, drop
+    if (d > periodFrom) return 'main';        // (periodFrom, periodTo]
+    return 'carry';                           // d <= periodFrom
+  };
 
   for (const row of state.sheets.advances || []) {
     const parsed = parseAdvanceRemark(getCol(row, 'remark\\s*1'));
@@ -1896,12 +2042,16 @@ function fetchAdvancesForDriver() {
     const did = didCol || parsed.driverId;
     if (!did || did !== myId) continue;
     const d = parseDate(getCol(row, 'payment\\s*date', '^date'));
-    if (!inPeriod(d)) continue;
+    const cls = classify(d);
+    if (!cls) continue;
     const amount = Number(getCol(row, 'amount')) || 0;
     if (!amount) continue;
+    const position = nextPositionFor(counter, d, 'Account', amount);
+    const rowKey = advanceRowKey(myId, d, 'Account', amount, position);
+    if (cls === 'carry' && ded[rowKey]) continue;   // already settled, skip
     const type = normalizePaymentType(parsed.type || getCol(row, 'payment\\s*type', '^type$'));
     const remark = String(getCol(row, 'purpose', 'reason', 'remark\\s*3', 'remark\\s*2') || '').trim();
-    out.push({ amount, date: d, mode: 'Account', type, remark, rowKey: advanceRowKey(myId, d, 'Account', amount, remark), removed: false, manual: false });
+    out.push({ amount, date: d, mode: 'Account', type, remark, position, rowKey, removed: false, manual: false, carryOver: cls === 'carry' });
   }
 
   for (const row of state.sheets.upi || []) {
@@ -1913,12 +2063,16 @@ function fetchAdvancesForDriver() {
     const did = didCol || parseUpiParticulars(getCol(row, 'particulars'));
     if (!did || did === 'D00000' || did !== myId) continue;
     const d = parseDate(getCol(row, '^date'));
-    if (!inPeriod(d)) continue;
+    const cls = classify(d);
+    if (!cls) continue;
     // UPI amount comes from column G — "GROSS TYPE" — not the IMPREST column H.
     const amount = Number(getCol(row, 'gross\\s*type')) || 0;
     if (!amount) continue;
+    const position = nextPositionFor(counter, d, 'UPI', amount);
+    const rowKey = advanceRowKey(myId, d, 'UPI', amount, position);
+    if (cls === 'carry' && ded[rowKey]) continue;
     const remark = String(getCol(row, 'voucher\\s*no', 'particulars') || '').trim();
-    out.push({ amount, date: d, mode: 'UPI', type: 'Trip Advance', remark, rowKey: advanceRowKey(myId, d, 'UPI', amount, remark), removed: false, manual: false });
+    out.push({ amount, date: d, mode: 'UPI', type: 'Trip Advance', remark, position, rowKey, removed: false, manual: false, carryOver: cls === 'carry' });
   }
 
   for (const row of state.sheets.cash || []) {
@@ -1929,14 +2083,24 @@ function fetchAdvancesForDriver() {
     // CASH SHEET has two date columns; "Standard Date" is the cleaned/normalized one
     // while "DATE" can be the raw entry-form value (sometimes the wrong calendar day).
     const d = parseDate(getCol(row, 'standard\\s*date', '^date'));
-    if (!inPeriod(d)) continue;
+    const cls = classify(d);
+    if (!cls) continue;
     const amount = Number(getCol(row, 'amount')) || 0;
     if (!amount) continue;
+    const position = nextPositionFor(counter, d, 'Cash', amount);
+    const rowKey = advanceRowKey(myId, d, 'Cash', amount, position);
+    if (cls === 'carry' && ded[rowKey]) continue;
     const remark = String(getCol(row, 'remark', 'to\\s*location') || '').trim();
     const type = parseCashType(getCol(row, 'remark'), getCol(row, 'to\\s*location'));
-    out.push({ amount, date: d, mode: 'Cash', type, remark, rowKey: advanceRowKey(myId, d, 'Cash', amount, remark), removed: false, manual: false });
+    out.push({ amount, date: d, mode: 'Cash', type, remark, position, rowKey, removed: false, manual: false, carryOver: cls === 'carry' });
   }
 
+  // Carry-over rows first (older skipped advances bubble to the top of the
+  // wizard's advance pane), then current-period rows in source order.
+  out.sort((a, b) => {
+    if (a.carryOver !== b.carryOver) return a.carryOver ? -1 : 1;
+    return 0;
+  });
   return out;
 }
 
@@ -2146,30 +2310,39 @@ function renderAdvances() {
     c.innerHTML = `<div class="warn-box">No advances on file for this period. Add manually if needed.</div>`;
     return;
   }
-  // Period-based lock: any advance whose date falls inside a settled period for
-  // this driver is locked, regardless of remark/voucher/amount drift between
-  // workbook re-uploads.
-  const order = state.advances.map((a, i) => {
+  // Per-advance lock: only the specific rows that were actually deducted in some
+  // past settlement are locked. The fetch step already excluded carry-over rows
+  // that are already in deductedAdvances, so findAdvanceLock here mostly catches
+  // the case where the same wizard is restarted after a submit (in-session lock).
+  const decorated = state.advances.map((a, i) => {
     const lockMeta = findAdvanceLock(a);
     return { a, i, locked: !!lockMeta, lockMeta };
   });
-  order.forEach(o => { if (o.locked) o.a.removed = true; });
-  order.sort((x, y) => (x.locked === y.locked) ? 0 : (x.locked ? 1 : -1));
+  decorated.forEach(o => { if (o.locked) o.a.removed = true; });
+
+  // Section split: carry-over rows first (older skipped advances), then the
+  // current period's rows. Inside each section, locked rows sort to the bottom.
+  const carry = decorated.filter(o => o.a.carryOver);
+  const main  = decorated.filter(o => !o.a.carryOver);
+  const sortLockedDown = (x, y) => (x.locked === y.locked) ? 0 : (x.locked ? 1 : -1);
+  carry.sort(sortLockedDown);
+  main.sort(sortLockedDown);
+
   const skipped = state.advances.filter(a => !a.removed && !isDeductibleAdvance(a))
                                  .reduce((s, a) => s + a.amount, 0);
-  let html = `<table><thead><tr><th>Date</th><th>Type</th><th>Mode</th><th class="right">Amount</th><th>Remark</th><th></th></tr></thead><tbody>`;
-  order.forEach(({ a, i, locked, lockMeta }) => {
+
+  const renderRow = ({ a, i, locked, lockMeta }) => {
     const ded = isDeductibleAdvance(a);
     const typeLabel = a.type || (a.manual ? 'Manual' : '(none)');
     const typeBadge = `<span class="badge ${ded ? 'ok' : 'muted'}">${typeLabel}${ded ? '' : ' — not deducted'}</span>`;
     const lockBadge = lockMeta
-      ? ` <span class="badge muted" title="Already covered by settlement ${escapeHtmlSimple(lockMeta.settlementId)} (period ${escapeHtmlSimple(lockMeta.from)} → ${escapeHtmlSimple(lockMeta.to)})">🔒 Settled in ${escapeHtmlSimple(lockMeta.settlementId)}</span>`
+      ? ` <span class="badge muted" title="Already deducted in settlement ${escapeHtmlSimple(lockMeta.settlementId)}${lockMeta.settledOn ? ' on ' + escapeHtmlSimple(lockMeta.settledOn) : ''}">🔒 Settled in ${escapeHtmlSimple(lockMeta.settlementId)}</span>`
       : '';
     const removeBtn = locked
-      ? `<button class="secondary small" disabled style="cursor:not-allowed;opacity:0.6" title="This advance's date falls in a period already settled for this driver.">Locked</button>`
+      ? `<button class="secondary small" disabled style="cursor:not-allowed;opacity:0.6" title="This advance was already deducted in a prior settlement.">Locked</button>`
       : `<button class="${a.removed ? '' : 'danger'} small" onclick="toggleRemoveAdv(${i})">${a.removed ? 'Restore' : 'Remove'}</button>`;
     const rowClass = locked ? 'removed muted' : (a.removed ? 'removed' : '');
-    html += `<tr class="${rowClass}">
+    return `<tr class="${rowClass}">
       <td>${a.date}</td>
       <td>${typeBadge}</td>
       <td><span class="badge ${a.mode === 'Cash' ? 'warn' : 'ok'}">${a.mode}</span></td>
@@ -2177,8 +2350,22 @@ function renderAdvances() {
       <td>${a.remark || ''}${a.manual ? ' <span class="badge muted">manual</span>' : ''}${lockBadge}</td>
       <td>${removeBtn}</td>
     </tr>`;
-  });
-  html += '</tbody></table>';
+  };
+  const renderTable = rows => `<table><thead><tr><th>Date</th><th>Type</th><th>Mode</th><th class="right">Amount</th><th>Remark</th><th></th></tr></thead><tbody>${rows.map(renderRow).join('')}</tbody></table>`;
+
+  let html = '';
+  if (carry.length) {
+    html += `<div class="info" style="margin-bottom:6px"><strong>🔁 Carry-over from prior periods</strong> &nbsp;<span class="muted">— these advances were skipped in earlier settlements and have not yet been deducted. Include them here, or remove again to keep deferring.</span></div>`;
+    html += renderTable(carry);
+    html += `<h3 style="margin-top:18px">Current period &nbsp;<span class="muted" style="text-transform:none;letter-spacing:0">${escapeHtmlSimple(state.periodFrom || '')} → ${escapeHtmlSimple(state.periodTo || '')}</span></h3>`;
+  }
+  if (main.length) {
+    html += renderTable(main);
+  } else if (!carry.length) {
+    html += `<div class="warn-box">No advances on file for this period. Add manually if needed.</div>`;
+  } else {
+    html += `<div class="muted">No new advances in the current period — only carry-over above.</div>`;
+  }
   if (skipped > 0) {
     html += `<div class="muted" style="margin-top:8px">Excluded from deductions (Trip Settlement / Salary entries): <strong>${fmt(skipped)}</strong></div>`;
   }
@@ -2194,8 +2381,14 @@ window.addManualAdvance = () => {
   const remark = $('man-adv-remark').value.trim();
   if (!amount || amount <= 0) { alert('Amount must be > 0'); return; }
   if (!date) { alert('Date required'); return; }
-  const rowKey = advanceRowKey(state.driver && state.driver.id, date, mode, amount, remark);
-  state.advances.push({ amount, date, mode, remark, rowKey, removed: false, manual: true });
+  // Position for a manual advance = count of existing state.advances with the
+  // same (date, mode, rounded amount). Keeps the stable key unique even if the
+  // admin adds two identical manual rows on the same day.
+  const amt = Math.round(amount);
+  const position = state.advances.filter(a => a.date === date && a.mode === mode && Math.round(Number(a.amount) || 0) === amt).length;
+  const driverId = state.driver && state.driver.id;
+  const rowKey = advanceRowKey(driverId, date, mode, amount, position);
+  state.advances.push({ amount, date, mode, remark, position, rowKey, removed: false, manual: true, carryOver: false });
   ['man-adv-amount','man-adv-date','man-adv-remark'].forEach(id => $(id).value = '');
   renderAdvances();
 };
@@ -2208,12 +2401,12 @@ $('to-step-5').addEventListener('click', () => {
       return;
     }
   }
-  // Block if any advance falls within a period already settled for this driver
-  // (defense in depth — the UI already forces locked rows to removed:true and
-  // disables the restore button, but a tampered state could otherwise sneak through).
+  // Block if any advance was already deducted in a prior settlement (defense in
+  // depth — the UI already forces locked rows to removed:true and disables the
+  // restore button, but a tampered state could otherwise sneak through).
   const blockedAdv = state.advances.filter(a => !a.removed && findAdvanceLock(a));
   if (blockedAdv.length > 0) {
-    alert(`Cannot proceed — these advances fall in a period already settled for this driver: ${blockedAdv.map(a => `${a.date} ${a.mode} ${fmt(a.amount)}`).join(', ')}. They are locked and cannot be re-included.`);
+    alert(`Cannot proceed — these advances were already deducted in a prior settlement: ${blockedAdv.map(a => `${a.date} ${a.mode} ${fmt(a.amount)}`).join(', ')}. They are locked and cannot be re-included.`);
     return;
   }
   buildTripInputs();
@@ -2803,12 +2996,13 @@ function buildSettlementPayload(sId, finalizedOn) {
     'Settled On': finalizedOn,
   }));
 
-  // Full per-advance detail (every advance considered, flagged whether it was deducted).
-  // 'Row Key' is the same driver-scoped composite the wizard uses to lock an advance
-  // from re-inclusion; storing it on the doc lets future settlements rebuild the lock
-  // index without recomputing from individual fields.
+  // Full per-advance detail for the advances actually deducted (admin did not
+  // remove). 'Row Key' is the stable driver-scoped composite the wizard uses to
+  // lock an advance from re-inclusion; the Firestore listener rebuilds
+  // state.settledIndex.deductedAdvances from these keys, so every row written
+  // here is one row locked-forever-or-until-the-settlement-is-deleted.
   const advanceRows = state.advances.filter(a => !a.removed).map(a => {
-    const rk = a.rowKey || advanceRowKey(state.driver.id, a.date, a.mode, a.amount, a.remark);
+    const rk = a.rowKey || advanceRowKey(state.driver.id, a.date, a.mode, a.amount, a.position || 0);
     return {
       'Settlement ID': sId,
       'Settlement Date': finalizedOn,
@@ -2824,8 +3018,6 @@ function buildSettlementPayload(sId, finalizedOn) {
     };
   });
 
-  // Persisted 'Row Key' column on each advance row stays as audit data, but the
-  // lock mechanism no longer reads it — advances are locked by period overlap.
   const settledAdvanceKeys = advanceRows.map(r => ({
     rowKey: r['Row Key'],
     driverId: r['Driver ID'],
@@ -2865,14 +3057,12 @@ async function finalize() {
       btn.disabled = false; btn.textContent = original; return;
     }
 
-    // Snapshot the advance + trip lists for the PDF BEFORE the Firestore listener
+    // Snapshot the advance list for the PDF BEFORE the Firestore listener
     // can re-fire. Once this settlement lands in Firestore, the onSnapshot listener
-    // rebuilds state.settledIndex.advancePeriods to include this very period, and
-    // its renderAdvances() pass marks every advance in state.advances as
-    // .removed = true (because every one now matches findAdvanceLock on the
-    // just-settled period). Reading state.advances live in bundleFromState after
-    // that would produce an empty PDF advance list, even though the saved doc has
-    // the right rows. Pin the printable view to the data we actually saved.
+    // adds every just-deducted row's Row Key to state.settledIndex.deductedAdvances,
+    // and its renderAdvances() pass would mark those advances .removed = true.
+    // Reading state.advances live in bundleFromState after that would produce an
+    // empty PDF advance list. Pin the printable view to the data we actually saved.
     state.result.pdfAdvanceRows = state.advances.filter(a => !a.removed).map(a => ({
       date: a.date, mode: a.mode, type: a.type, amount: a.amount, deducted: isDeductibleAdvance(a),
     }));
@@ -2891,17 +3081,17 @@ async function finalize() {
     // In-session settled index so the same trips + advances can't be re-settled in
     // another wizard run before the live snapshot round-trips back.
     const tripsIdx = (state.settledIndex && state.settledIndex.trips) || {};
-    const periodsIdx = (state.settledIndex && state.settledIndex.advancePeriods) || {};
+    const dedIdx = (state.settledIndex && state.settledIndex.deductedAdvances) || {};
     payload.settledIndexRows.forEach(r => {
       const tn = tripIdKey(r['Trip No']);
       if (tn) tripsIdx[tn] = { driverId: r['Driver ID'], settlementId: r['Settlement ID'], settledOn: r['Settled On'] };
     });
     const did = String(state.driver.id || '').trim().toUpperCase();
-    if (did && state.periodFrom && state.periodTo) {
-      if (!periodsIdx[did]) periodsIdx[did] = [];
-      periodsIdx[did].push({ from: state.periodFrom, to: state.periodTo, settlementId: sId, settledOn: finalizedOn });
-    }
-    state.settledIndex = { trips: tripsIdx, advancePeriods: periodsIdx };
+    payload.advanceRows.forEach(r => {
+      const rk = r['Row Key'];
+      if (rk) dedIdx[rk] = { driverId: did, settlementId: sId, settledOn: finalizedOn };
+    });
+    state.settledIndex = { trips: tripsIdx, deductedAdvances: dedIdx };
 
     state.result.settlementId = sId;
     state.result.finalizedOn = finalizedOn;
