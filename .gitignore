@@ -4,6 +4,9 @@ service-account.json
 # Node deps if any (firebase-admin for provisioning)
 node_modules/
 
+# Firebase Hosting deploy cache (local only)
+.firebase/
+
 # Local OS noise
 .DS_Store
 Thumbs.db

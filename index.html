@@ -230,7 +230,6 @@
     </div>
     <div class="actions" style="justify-content:flex-start;margin-bottom:12px">
       <button class="secondary small" type="button" onclick="exportAllRecords()">⬇ Download full Excel</button>
-      <button class="danger small" type="button" onclick="clearRecords()">🗑 Clear all records</button>
     </div>
     <div id="records-list"></div>
   </div>
@@ -941,9 +940,13 @@ async function renderRecordsList() {
   }
   state.records.list = rows;
   if (!rows.length) { c.innerHTML = '<div class="muted">No settlements yet.</div>'; return; }
+  const showDelete = isAdmin();
   let html = '<table><thead><tr><th>Settlement ID</th><th>Date</th><th>Driver</th><th class="right">Net &#8377;</th><th>Status</th><th></th></tr></thead><tbody>';
   rows.forEach(r => {
     const sid = r._id;
+    const deleteBtn = showDelete
+      ? ` <button class="danger small" type="button" onclick="deleteSettlement('${escapeHtmlSimple(sid)}')" title="Permanently delete this settlement">🗑 Delete</button>`
+      : '';
     html += `<tr>
       <td>${escapeHtmlSimple(sid || '')}</td>
       <td>${escapeHtmlSimple(r['Date'] || '')}</td>
@@ -952,7 +955,7 @@ async function renderRecordsList() {
       <td>${statusBadge(r['Status'])}</td>
       <td style="white-space:nowrap">
         <button class="secondary small" type="button" onclick="openRecord('${sid}')">Open</button>
-        <button class="secondary small" type="button" onclick="downloadRecordPdf('${sid}')" title="Download PDF">📄 PDF</button>
+        <button class="secondary small" type="button" onclick="downloadRecordPdf('${sid}')" title="Download PDF">📄 PDF</button>${deleteBtn}
       </td>
     </tr>`;
   });
@@ -1188,23 +1191,26 @@ async function downloadRecordPdf(id) {
 function openRecordsModal() { $('records-overlay').style.display = 'flex'; renderRecordsList(); }
 function closeRecordsModal() { $('records-overlay').style.display = 'none'; }
 
-async function clearRecords() {
-  if (!isAdmin()) { alert('Only admins can clear records.'); return; }
-  if (!confirm('Permanently delete ALL settlements (including edit logs)? This cannot be undone.')) return;
+// Delete a single settlement. Admin-only (also enforced server-side by
+// firestore.rules). The settlement doc plus its editLog subcollection are
+// removed atomically in one batch — same pattern as the legacy bulk clear,
+// so a settlement that has any edit-log entries follows the same constraints.
+async function deleteSettlement(id) {
+  if (!isAdmin()) { alert('Only admins can delete settlements.'); return; }
+  if (!id) return;
+  if (!confirm(`Permanently delete settlement ${id}? This unlocks its trips and the period it covered, and cannot be undone.`)) return;
   try {
-    const snap = await fbDb.collection('settlements').get();
-    for (const docu of snap.docs) {
-      const logSnap = await docu.ref.collection('editLog').get();
-      const batch = fbDb.batch();
-      logSnap.docs.forEach(l => batch.delete(l.ref));
-      batch.delete(docu.ref);
-      await batch.commit();
-    }
-    state.records = { list: [], opened: null, openedEditLog: [] };
+    const ref = fbDb.collection('settlements').doc(id);
+    const logSnap = await ref.collection('editLog').get();
+    const batch = fbDb.batch();
+    logSnap.docs.forEach(l => batch.delete(l.ref));
+    batch.delete(ref);
+    await batch.commit();
+    // The Firestore onSnapshot listener will re-fire and rebuild the lock index
+    // automatically — no manual state.settledIndex cleanup needed here.
     renderRecordsList();
-    alert('All records cleared.');
   } catch (err) {
-    alert('Clear failed: ' + (err.message || err));
+    alert('Delete failed: ' + (err.message || err));
   }
 }
 
@@ -1241,7 +1247,7 @@ async function exportAllRecords() {
   }
 }
 window.closeRecordsModal = closeRecordsModal;
-window.clearRecords = clearRecords;
+window.deleteSettlement = deleteSettlement;
 window.exportAllRecords = exportAllRecords;
 window.openRecord = openRecord;
 window.renderRecordsList = renderRecordsList;
@@ -2859,6 +2865,18 @@ async function finalize() {
       btn.disabled = false; btn.textContent = original; return;
     }
 
+    // Snapshot the advance + trip lists for the PDF BEFORE the Firestore listener
+    // can re-fire. Once this settlement lands in Firestore, the onSnapshot listener
+    // rebuilds state.settledIndex.advancePeriods to include this very period, and
+    // its renderAdvances() pass marks every advance in state.advances as
+    // .removed = true (because every one now matches findAdvanceLock on the
+    // just-settled period). Reading state.advances live in bundleFromState after
+    // that would produce an empty PDF advance list, even though the saved doc has
+    // the right rows. Pin the printable view to the data we actually saved.
+    state.result.pdfAdvanceRows = state.advances.filter(a => !a.removed).map(a => ({
+      date: a.date, mode: a.mode, type: a.type, amount: a.amount, deducted: isDeductibleAdvance(a),
+    }));
+
     // Compose a single Firestore document per settlement — trips + advances + truck-log embedded.
     const docData = Object.assign({}, payload.summaryRow, {
       trips: payload.driverLogRows,
@@ -2936,7 +2954,9 @@ function bundleFromState() {
       expLoadUnload: calc.exp.loadUnload, expRepairs: calc.exp.repairs, expToll: calc.exp.toll,
       expRoad: calc.exp.road, expOthers: calc.exp.others, expTotal: calc.expensesTotal, settlement: calc.settlement,
     })),
-    advanceRows: state.advances.filter(a => !a.removed).map(a => ({
+    // Use the snapshot captured in finalize() if available — see the comment there
+    // for why reading state.advances live here can produce an empty PDF on submit.
+    advanceRows: r.pdfAdvanceRows || state.advances.filter(a => !a.removed).map(a => ({
       date: a.date, mode: a.mode, type: a.type, amount: a.amount, deducted: isDeductibleAdvance(a),
     })),
     editLogRows: [],
