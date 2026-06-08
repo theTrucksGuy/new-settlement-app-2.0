@@ -688,6 +688,12 @@ function startSettledIndexSync() {
       const docCounter = new Map();
       (d.advances || []).forEach(row => {
         if (!row) return;
+        // An advance only locks future settlements if it was actually deducted. A
+        // normally-deductible advance an admin un-deducted (Deducted:'No') must resurface
+        // as a carry-over candidate. Non-deductible types (salary / trip settlement) are
+        // written Deducted:'No' by design and stay locked so they don't re-clutter.
+        const deducted = String(row['Deducted'] || 'Yes') === 'Yes';
+        if (!deducted && isDeductibleAdvance({ type: row['Type'] })) return;
         const persistedRk = row['Row Key'];
         if (persistedRk && /\|\d+$/.test(persistedRk)) {
           deductedAdvances[persistedRk] = meta;
@@ -1045,11 +1051,12 @@ function renderOpenedRecord() {
       </div>
     </div>`).join('');
 
-  const advHtml = advs.length ? `<table><thead><tr><th>Date</th><th>Mode</th><th>Type</th><th class="right">Amount</th><th>Deducted</th></tr></thead><tbody>
+  const advHtml = advs.length ? `<table><thead><tr><th>Date</th><th>Mode</th><th>Type</th><th class="right">Amount</th><th>Deducted</th>${canEdit ? '<th>Remove</th>' : ''}</tr></thead><tbody>
       ${advs.map((a, i) => `<tr>
         <td>${escapeHtmlSimple(a['Advance Date'] || '')}</td><td>${escapeHtmlSimple(a['Mode'] || '')}</td><td>${escapeHtmlSimple(a['Type'] || '')}</td>
         <td class="right"><input type="number" min="0" style="width:110px" data-kind="adv" data-i="${i}" data-field="Amount" value="${num(a['Amount'])}" ${ro}></td>
         <td><input type="checkbox" data-kind="adv" data-i="${i}" data-field="Deducted" ${a['Deducted'] === 'Yes' ? 'checked' : ''} ${ro}></td>
+        ${canEdit ? `<td><input type="checkbox" data-kind="adv-remove" data-i="${i}" title="Remove this advance from the settlement; it returns to the carry-over pool" ${ro}></td>` : ''}
       </tr>`).join('')}</tbody></table>` : '<div class="muted">No advances on this settlement.</div>';
 
   const editHtml = edits.length ? `<table><thead><tr><th>When</th><th>By</th><th>Field</th><th>Old &rarr; New</th></tr></thead><tbody>
@@ -1138,9 +1145,16 @@ async function applyRecordEdits(id) {
     const oldV = Number(row[field]) || 0, newV = Number(el.value) || 0;
     if (oldV !== newV) { log(row['Trip No'] || ('Trip ' + (i + 1)), field, oldV, newV); row[field] = newV; }
   });
+  // Advances flagged for removal — the row is dropped from the settlement entirely so
+  // it unlocks and resurfaces as a carry-over candidate on the next settlement.
+  const removeAdv = {};
+  document.querySelectorAll('#records-list [data-kind="adv-remove"]').forEach(el => {
+    if (el.checked) removeAdv[Number(el.dataset.i)] = true;
+  });
   document.querySelectorAll('#records-list [data-kind="adv"]').forEach(el => {
     const i = Number(el.dataset.i), field = el.dataset.field;
     const row = advs[i]; if (!row) return;
+    if (removeAdv[i]) return; // row is being removed; skip field-edit logging
     if (field === 'Amount') {
       const o = Number(row['Amount']) || 0, n = Number(el.value) || 0;
       if (o !== n) { log('Advance ' + (i + 1), 'Amount', o, n); row['Amount'] = n; }
@@ -1148,6 +1162,12 @@ async function applyRecordEdits(id) {
       const o = row['Deducted'] || 'No', n = el.checked ? 'Yes' : 'No';
       if (o !== n) { log('Advance ' + (i + 1), 'Deducted', o, n); row['Deducted'] = n; }
     }
+  });
+  const keptAdvs = advs.filter((row, i) => {
+    if (!removeAdv[i]) return true;
+    const desc = [row['Mode'], row['Advance Date'], '₹' + (Number(row['Amount']) || 0)].filter(Boolean).join(' ');
+    log('Advance ' + (i + 1), 'Removed', desc, '(removed)');
+    return false;
   });
   const inc = Number($('er-incentive').value) || 0, incR = ($('er-incentive-reason').value || '').trim();
   const pen = Number($('er-penalty').value) || 0, penR = ($('er-penalty-reason').value || '').trim();
@@ -1159,7 +1179,7 @@ async function applyRecordEdits(id) {
   if (!newEdits.length) { alert('No changes to save.'); return; }
 
   const updated = Object.assign({}, s, {
-    trips, advances: advs, Incentive: inc, 'Incentive Reason': incR,
+    trips, advances: keptAdvs, Incentive: inc, 'Incentive Reason': incR,
     Penalty: pen, 'Penalty Reason': penR, 'Last Edited': ts,
   });
   delete updated._id;
@@ -1529,6 +1549,21 @@ document.querySelectorAll('#source-tabs .tab').forEach(tab => {
 // Restore saved proxy URL
 $('proxy-url').value = localStorage.getItem(STORAGE.proxyUrl) || '';
 
+// Warn up front when the app is opened as a local file (file://). A null-origin page
+// has its cross-origin fetch() to Google blocked by the browser, so live fetch / proxy
+// connects fail with a bare "Failed to fetch". Surface this before the user even tries.
+if (location.protocol === 'file:') {
+  const notice = '<div style="margin-top:10px;padding:8px 10px;border:1px solid var(--border);'
+    + 'border-radius:8px;background:var(--panel-2);color:var(--text);font-size:12px">'
+    + '⚠️ You\'re running this app as a local file (<code>file://</code>). Browsers block live '
+    + 'data fetches from a local file, so this may fail with “Failed to fetch”. Serve it over '
+    + '<code>http://localhost</code> (e.g. <code>python -m http.server</code>), or use the '
+    + '<strong>📁 Upload workbook file</strong> panel — both work without a server.</div>';
+  const fs = $('fetch-status'), ps = $('proxy-status');
+  if (fs) fs.innerHTML = notice;
+  if (ps) ps.innerHTML = notice;
+}
+
 // ---------- Proxy helpers ----------
 function getProxyUrl() {
   const u = ($('proxy-url').value || '').trim();
@@ -1783,7 +1818,20 @@ async function fetchWorkbookFromUrl(rawUrl) {
     const ss = String(ts.getSeconds()).padStart(2, '0');
     statusEl.innerHTML = `<span style="color:var(--ok)">✓ Fetched at ${hh}:${mm}:${ss}</span> <span class="muted">· ${sizeMb} MB · ${secs} s · Google caches published exports for ~5 min, so very recent edits may not appear yet.</span>`;
   } catch (err) {
-    statusEl.innerHTML = `<span style="color:var(--bad)">Fetch failed: ${escapeHtmlSimple(err.message || String(err))}</span>`;
+    // A bare TypeError ("Failed to fetch") means the browser blocked the request
+    // before any response arrived — almost always CORS: Google's output=xlsx export
+    // redirects to a googleusercontent.com host that sends no Access-Control-Allow-Origin
+    // header (and a file:// page's null origin is rejected outright). The page can't
+    // bypass this, so steer the user to the two paths that do work.
+    const isNetwork = (err instanceof TypeError) || /failed to fetch|networkerror|load failed/i.test(err.message || '');
+    if (isNetwork) {
+      statusEl.innerHTML = `<span style="color:var(--bad)">Fetch failed: the browser blocked the request (CORS).</span>
+        <div class="muted" style="margin-top:6px;font-size:12px">Google's published <code>xlsx</code> export can't be read directly from a browser. Use either:
+        <strong>Upload workbook file</strong> (File → Download → Excel <code>.xlsx</code> in Google Sheets, then drop it on the right) — or the
+        <strong>Apps Script proxy</strong> on the “Google Sheets” tab (see <code>apps-script/SETUP.md</code>). Opening this app over <code>http(s)://</code> instead of a <code>file://</code> path also helps.</div>`;
+    } else {
+      statusEl.innerHTML = `<span style="color:var(--bad)">Fetch failed: ${escapeHtmlSimple(err.message || String(err))}</span>`;
+    }
   } finally {
     btn.disabled = false; btn.textContent = original;
   }
