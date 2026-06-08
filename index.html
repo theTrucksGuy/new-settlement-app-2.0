@@ -410,7 +410,13 @@
         <option value="Account">Account</option>
       </select>
     </div>
-    <div style="margin-top:8px">
+    <div class="grid-2" style="margin-top:8px">
+      <select id="man-adv-type" title="Type controls whether this advance is deducted from pay">
+        <option value="Trip Advance">Trip Advance</option>
+        <option value="Salary Advance">Salary Advance</option>
+        <option value="Trip Settlement">Trip Settlement (not deducted)</option>
+        <option value="Salary">Salary (not deducted)</option>
+      </select>
       <input type="text" id="man-adv-remark" placeholder="Reference / remark" />
     </div>
     <div class="actions" style="justify-content:flex-start; margin-top:8px">
@@ -436,18 +442,25 @@
   <!-- Step 6: Adjustments -->
   <section class="card" id="step-6">
     <h2>Step 7 &mdash; Final Adjustments</h2>
+    <p class="muted" style="margin-top:0">Add any number of incentive and penalty lines. Each is listed separately on the settlement and PDF.</p>
     <div class="grid-2">
       <div>
-        <label>Incentive amount (₹)</label>
-        <input type="number" id="incentive-amount" value="0" min="0" />
-        <label style="margin-top:8px">Reason</label>
-        <input type="text" id="incentive-reason" placeholder="e.g. Customer praise, festival bonus" />
+        <h3 style="margin:0 0 6px">Incentives (+)</h3>
+        <div id="wiz-incentives"></div>
+        <div class="grid-3" style="align-items:end;margin-top:8px">
+          <input type="number" id="wiz-inc-amount" placeholder="Amount (₹)" min="0" />
+          <input type="text" id="wiz-inc-reason" placeholder="Reason (e.g. festival bonus)" />
+          <button class="secondary small" type="button" onclick="wizAddIncentive()">+ Add incentive</button>
+        </div>
       </div>
       <div>
-        <label>Penalty amount (₹)</label>
-        <input type="number" id="penalty-amount" value="0" min="0" />
-        <label style="margin-top:8px">Reason</label>
-        <input type="text" id="penalty-reason" placeholder="e.g. Late return, damages" />
+        <h3 style="margin:0 0 6px">Penalties (−)</h3>
+        <div id="wiz-penalties"></div>
+        <div class="grid-3" style="align-items:end;margin-top:8px">
+          <input type="number" id="wiz-pen-amount" placeholder="Amount (₹)" min="0" />
+          <input type="text" id="wiz-pen-reason" placeholder="Reason (e.g. late return)" />
+          <button class="secondary small" type="button" onclick="wizAddPenalty()">+ Add penalty</button>
+        </div>
       </div>
     </div>
     <div class="actions between">
@@ -580,6 +593,8 @@ const state = {
   incentiveReason: '',
   penalty: 0,
   penaltyReason: '',
+  incentives: [],   // [{ amount, reason }] — multiple incentive lines
+  penalties: [],    // [{ amount, reason }] — multiple penalty lines
   result: null,
   // Locally-managed routes & vehicle-type memory
   savedRoutes: [],        // [{name, truckRate, trailerRate}]
@@ -1009,7 +1024,11 @@ async function openRecord(id) {
   try {
     const docSnap = await fbDb.collection('settlements').doc(id).get();
     if (!docSnap.exists) { renderRecordsList(); return; }
-    state.records.opened = Object.assign({ _id: id }, docSnap.data());
+    const data = docSnap.data();
+    state.records.opened = Object.assign({ _id: id }, data);
+    // Baseline counts (as persisted) so applyRecordEdits can log rows the admin
+    // adds in this session — the cached doc is mutated in place when adding.
+    state.records.openedBaseline = { trips: (data.trips || []).length, advances: (data.advances || []).length };
     const logSnap = await fbDb.collection('settlements').doc(id).collection('editLog').orderBy('timestamp', 'desc').get();
     state.records.openedEditLog = logSnap.docs.map(d => Object.assign({ _id: d.id }, d.data()));
   } catch (err) {
@@ -1034,6 +1053,13 @@ function renderOpenedRecord() {
   const ro = canEdit ? '' : 'disabled';
   const num = v => Number(v) || 0;
   const ef = (i, field, label) => `<div><label>${label}</label><input type="number" min="0" data-kind="trip" data-i="${i}" data-field="${field}" value="${num(trips[i][field])}" ${ro}></div>`;
+
+  // Incentives/penalties are arrays of {amount, reason}. Migrate legacy scalar docs
+  // to a one-row array on first open so the edit UI manages them uniformly; the
+  // cached opened doc doubles as the working copy (re-opening reloads from Firestore).
+  if (!Array.isArray(s.incentives)) s.incentives = num(s['Incentive']) ? [{ amount: num(s['Incentive']), reason: s['Incentive Reason'] || '' }] : [];
+  if (!Array.isArray(s.penalties))  s.penalties  = num(s['Penalty'])   ? [{ amount: num(s['Penalty']),   reason: s['Penalty Reason'] || '' }] : [];
+  const incs = s.incentives, pens = s.penalties;
 
   const tripsHtml = trips.map((t, i) => `
     <div class="trip-card" style="margin:6px 0">
@@ -1063,6 +1089,40 @@ function renderOpenedRecord() {
       ${edits.map(e => `<tr><td>${escapeHtmlSimple(e.timestamp || '')}</td><td>${escapeHtmlSimple(e.editedBy || '')}</td><td>${escapeHtmlSimple((e.scope && e.scope !== 'summary' ? e.scope + ': ' : '') + (e.field || ''))}</td><td>${escapeHtmlSimple(String(e.oldValue) + ' → ' + String(e.newValue))}</td></tr>`).join('')}
       </tbody></table>` : '<div class="muted">No edits yet.</div>';
 
+  // Adjustment tables (multiple incentives / penalties). data-kind = inc | pen.
+  const adjTable = (rows, kind, label, sign) => {
+    const body = rows.length ? rows.map((r, i) => `<tr>
+        <td class="right"><input type="number" min="0" style="width:110px" data-kind="${kind}" data-i="${i}" data-field="amount" value="${num(r.amount)}" ${ro}></td>
+        <td><input type="text" style="width:100%" data-kind="${kind}" data-i="${i}" data-field="reason" value="${escapeHtmlSimple(r.reason || '')}" ${ro}></td>
+        ${canEdit ? `<td><input type="checkbox" data-kind="${kind}-remove" data-i="${i}" title="Remove this line" ${ro}></td>` : ''}
+      </tr>`).join('') : `<tr><td colspan="${canEdit ? 3 : 2}" class="muted">None.</td></tr>`;
+    const addBtn = canEdit ? `<button class="secondary small" type="button" onclick="erAdd${kind === 'inc' ? 'Incentive' : 'Penalty'}()">+ Add ${label.toLowerCase()}</button>` : '';
+    return `<table><thead><tr><th class="right">${label} (${sign}) ₹</th><th>Reason</th>${canEdit ? '<th>Remove</th>' : ''}</tr></thead><tbody>${body}</tbody></table><div style="margin-top:6px">${addBtn}</div>`;
+  };
+
+  // Mini-form to add an advance of any kind (Mode + Type) to this settlement.
+  const addAdvForm = canEdit ? `
+    <div class="grid-3" style="font-size:12px;margin-top:8px;align-items:end">
+      <div><label class="muted">Amount (₹)</label><input type="number" min="0" id="er-add-adv-amount"></div>
+      <div><label class="muted">Date</label><input type="date" id="er-add-adv-date"></div>
+      <div><label class="muted">Mode</label><select id="er-add-adv-mode"><option>Cash</option><option>UPI</option><option>Account</option></select></div>
+      <div><label class="muted">Type</label><select id="er-add-adv-type"><option>Trip Advance</option><option>Salary Advance</option><option>Trip Settlement</option><option>Salary</option></select></div>
+      <div><label class="muted">Remark</label><input type="text" id="er-add-adv-remark"></div>
+      <div><button class="secondary small" type="button" onclick="erAddAdvance()">+ Add advance</button></div>
+    </div>` : '';
+
+  // Mini-form to add a (manual) trip; rates/expenses are then fine-tuned in its card.
+  const addTripForm = canEdit ? `
+    <div class="grid-3" style="font-size:12px;margin-top:8px;align-items:end">
+      <div><label class="muted">Trip No</label><input type="text" id="er-add-trip-no"></div>
+      <div><label class="muted">Trip Date</label><input type="date" id="er-add-trip-date"></div>
+      <div><label class="muted">Vehicle</label><input type="text" id="er-add-trip-vehicle"></div>
+      <div><label class="muted">Route (From → To)</label><input type="text" id="er-add-trip-route"></div>
+      <div><label class="muted">Fixed Rate (₹)</label><input type="number" min="0" id="er-add-trip-rate"></div>
+      <div><label class="muted">Trip %</label><input type="number" min="0" max="100" id="er-add-trip-pct" value="100"></div>
+      <div><button class="secondary small" type="button" onclick="erAddTrip()">+ Add trip</button></div>
+    </div>` : '';
+
   const btns = [];
   if (canEdit)   btns.push(`<button class="secondary small" type="button" onclick="applyRecordEdits('${id}')">💾 Save changes</button>`);
   if (canVerify) btns.push(`<button class="secondary small" type="button" onclick="markVerified('${id}')">✓ Mark Verified</button>`);
@@ -1080,14 +1140,14 @@ function renderOpenedRecord() {
     </div>
     <h3 style="margin-top:12px">Trips (${trips.length})</h3>
     ${tripsHtml}
+    ${addTripForm}
     <h3 style="margin-top:12px">Advances</h3>
     ${advHtml}
+    ${addAdvForm}
     <h3 style="margin-top:12px">Adjustments</h3>
-    <div class="grid-3" style="font-size:12px">
-      <div><label>Incentive (+)</label><input type="number" min="0" id="er-incentive" value="${num(s['Incentive'])}" ${ro}></div>
-      <div><label>Incentive reason</label><input type="text" id="er-incentive-reason" value="${escapeHtmlSimple(s['Incentive Reason'] || '')}" ${ro}></div>
-      <div><label>Penalty (−)</label><input type="number" min="0" id="er-penalty" value="${num(s['Penalty'])}" ${ro}></div>
-      <div><label>Penalty reason</label><input type="text" id="er-penalty-reason" value="${escapeHtmlSimple(s['Penalty Reason'] || '')}" ${ro}></div>
+    <div class="grid-2" style="gap:14px;align-items:start">
+      <div><h4 style="margin:0 0 4px">Incentives (+)</h4>${adjTable(incs, 'inc', 'Incentive', '+')}</div>
+      <div><h4 style="margin:0 0 4px">Penalties (−)</h4>${adjTable(pens, 'pen', 'Penalty', '−')}</div>
     </div>
     <div class="summary-grid" style="margin-top:10px">
       <div class="label">Gross</div><div class="value num">${fmt(num(s['Gross']))}</div>
@@ -1099,6 +1159,58 @@ function renderOpenedRecord() {
     ${editHtml}
   `;
 }
+
+// ---------- Edit-screen add-row handlers ----------
+// Each mutates the cached opened doc (the working copy) and re-renders. Unsaved
+// additions are discarded if the record is re-opened (openRecord reloads from Firestore).
+function erEditable() {
+  const s = state.records.opened;
+  if (!s) return null;
+  if ((s['Status'] || 'Submitted') === 'Paid') { alert('This settlement is Paid and locked.'); return null; }
+  if (!isManager()) { alert('Only managers and admins can edit records.'); return null; }
+  return s;
+}
+window.erAddIncentive = () => { const s = erEditable(); if (!s) return; (s.incentives = s.incentives || []).push({ amount: 0, reason: '' }); renderOpenedRecord(); };
+window.erAddPenalty   = () => { const s = erEditable(); if (!s) return; (s.penalties  = s.penalties  || []).push({ amount: 0, reason: '' }); renderOpenedRecord(); };
+
+window.erAddAdvance = () => {
+  const s = erEditable(); if (!s) return;
+  const amount = Number($('er-add-adv-amount').value) || 0;
+  const date = $('er-add-adv-date').value;
+  const mode = $('er-add-adv-mode').value;
+  const type = $('er-add-adv-type').value;
+  const remark = ($('er-add-adv-remark').value || '').trim();
+  if (!amount || amount <= 0) { alert('Amount must be greater than 0.'); return; }
+  if (!date) { alert('Date is required.'); return; }
+  const driverId = s['Driver ID'];
+  const amt = Math.round(amount);
+  // Position = count of existing advances with the same (date, mode, rounded amount)
+  // so the stable Row Key stays unique — mirrors addManualAdvance().
+  const position = (s.advances || []).filter(a => a['Advance Date'] === date && a['Mode'] === mode && Math.round(Number(a['Amount']) || 0) === amt).length;
+  const rowKey = advanceRowKey(driverId, date, mode, amount, position);
+  (s.advances = s.advances || []).push({
+    'Settlement ID': s['Settlement ID'] || s._id, 'Driver ID': driverId, 'Driver Name': s['Driver Name'] || '',
+    'Advance Date': date, 'Mode': mode, 'Type': type, 'Amount': amt,
+    'Deducted': isDeductibleAdvance({ type }) ? 'Yes' : 'No', 'Remark': remark, 'Row Key': rowKey,
+  });
+  renderOpenedRecord();
+};
+
+window.erAddTrip = () => {
+  const s = erEditable(); if (!s) return;
+  const tripNo = ($('er-add-trip-no').value || '').trim() || `MAN-${s.trips ? s.trips.length + 1 : 1}`;
+  const date = $('er-add-trip-date').value;
+  if (!date) { alert('Trip date is required.'); return; }
+  (s.trips = s.trips || []).push({
+    'Trip No': tripNo, 'Trip Date': date, 'Vehicle': ($('er-add-trip-vehicle').value || '').trim().toUpperCase(),
+    'Route': ($('er-add-trip-route').value || '').trim(),
+    'Fixed Rate': Number($('er-add-trip-rate').value) || 0, 'Trip %': Number($('er-add-trip-pct').value) || 100,
+    'Halt Days': 0, 'Halt Rate': 0,
+    'Exp Loading/Unloading': 0, 'Exp Repairs': 0, 'Exp Toll': 0, 'Exp Road': 0, 'Exp Others': 0,
+    'Notes': 'Manual entry',
+  });
+  renderOpenedRecord();
+};
 
 // In-place recompute over a settlement doc (Firestore shape). Mutates and returns it.
 function recomputeSettlementDoc(s) {
@@ -1119,6 +1231,14 @@ function recomputeSettlementDoc(s) {
     if (a['Mode'] === 'Cash') cash += amt; else if (a['Mode'] === 'UPI') upi += amt; else acct += amt;
   });
   s['Gross'] = gross; s['Cash Advances'] = cash; s['UPI Advances'] = upi; s['Account Advances'] = acct;
+  // Incentives/Penalties are stored as arrays of {amount, reason}; the scalar
+  // Incentive/Penalty (+ reason) fields are kept as derived totals so the Net
+  // Payable formula and every legacy reader (PDF, summary grids) work unchanged.
+  // Legacy docs with no array keep their existing scalar values as-is.
+  const sumReasons = arr => arr.map(x => (x && x.reason || '').trim()).filter(Boolean).join('; ');
+  const sumAmounts = arr => arr.reduce((t, x) => t + num(x && x.amount), 0);
+  if (Array.isArray(s.incentives)) { s['Incentive'] = sumAmounts(s.incentives); s['Incentive Reason'] = sumReasons(s.incentives); }
+  if (Array.isArray(s.penalties))  { s['Penalty']   = sumAmounts(s.penalties);  s['Penalty Reason']   = sumReasons(s.penalties); }
   s['Net Payable'] = gross + num(s['Incentive']) - num(s['Penalty']) - cash - upi - acct;
   return s;
 }
@@ -1169,18 +1289,38 @@ async function applyRecordEdits(id) {
     log('Advance ' + (i + 1), 'Removed', desc, '(removed)');
     return false;
   });
-  const inc = Number($('er-incentive').value) || 0, incR = ($('er-incentive-reason').value || '').trim();
-  const pen = Number($('er-penalty').value) || 0, penR = ($('er-penalty-reason').value || '').trim();
-  log('summary', 'Incentive', Number(s['Incentive']) || 0, inc);
-  log('summary', 'Incentive Reason', s['Incentive Reason'] || '', incR);
-  log('summary', 'Penalty', Number(s['Penalty']) || 0, pen);
-  log('summary', 'Penalty Reason', s['Penalty Reason'] || '', penR);
+
+  // Read incentive / penalty tables back into arrays (skip rows flagged for removal).
+  const readAdj = (kind) => {
+    const remove = {};
+    document.querySelectorAll(`#records-list [data-kind="${kind}-remove"]`).forEach(el => { if (el.checked) remove[Number(el.dataset.i)] = true; });
+    const byIdx = {};
+    document.querySelectorAll(`#records-list [data-kind="${kind}"]`).forEach(el => {
+      const i = Number(el.dataset.i); if (remove[i]) return;
+      (byIdx[i] = byIdx[i] || { amount: 0, reason: '' });
+      if (el.dataset.field === 'amount') byIdx[i].amount = Number(el.value) || 0;
+      else byIdx[i].reason = (el.value || '').trim();
+    });
+    return Object.keys(byIdx).map(k => Number(k)).sort((a, b) => a - b)
+      .map(k => byIdx[k]).filter(r => r.amount > 0 || r.reason);
+  };
+  const incentives = readAdj('inc');
+  const penalties = readAdj('pen');
+  // Log incentive/penalty changes as old-total → new-total so the audit trail and
+  // the no-changes guard fire (covers add / edit / remove of lines).
+  const sumAmt = arr => arr.reduce((t, x) => t + (Number(x.amount) || 0), 0);
+  log('summary', 'Incentives total', Number(s['Incentive']) || 0, sumAmt(incentives));
+  log('summary', 'Penalties total', Number(s['Penalty']) || 0, sumAmt(penalties));
+
+  // Log trip / advance rows added this session (the cached doc was mutated on add).
+  const base = state.records.openedBaseline || { trips: trips.length, advances: keptAdvs.length };
+  if (trips.length > base.trips) log('summary', 'Trips added', base.trips, trips.length);
+  if (keptAdvs.length > base.advances) log('summary', 'Advances added', base.advances, keptAdvs.length);
 
   if (!newEdits.length) { alert('No changes to save.'); return; }
 
   const updated = Object.assign({}, s, {
-    trips, advances: keptAdvs, Incentive: inc, 'Incentive Reason': incR,
-    Penalty: pen, 'Penalty Reason': penR, 'Last Edited': ts,
+    trips, advances: keptAdvs, incentives, penalties, 'Last Edited': ts,
   });
   delete updated._id;
   recomputeSettlementDoc(updated);
@@ -1379,9 +1519,17 @@ function openDriverFolder(driverId) {
   const name = list[0] ? (list[0]['Driver Name'] || '') : '';
   const totalNet = list.reduce((s, r) => s + (Number(r['Net Payable']) || 0), 0);
 
+  const cumBtn = list.length
+    ? `<button class="secondary small" type="button" onclick="downloadCumulativePdf('${escapeHtmlSimple(driverId)}')" title="One PDF combining every settlement in this folder">⬇ Download cumulative PDF</button>`
+    : '';
   let html = `<button class="secondary small" type="button" onclick="renderDriverFolderList(($('driver-records-search')||{}).value||'')">&larr; Back to all drivers</button>
-    <h3 style="margin:12px 0 4px">📁 ${escapeHtmlSimple(name || '(unnamed)')} <span class="muted">${escapeHtmlSimple(driverId)}</span></h3>
-    <div class="muted" style="margin-bottom:10px;font-size:12px">${list.length} settlement${list.length === 1 ? '' : 's'} · Total Net &#8377;${fmtNum(totalNet)}</div>`;
+    <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:10px;flex-wrap:wrap">
+      <div>
+        <h3 style="margin:12px 0 4px">📁 ${escapeHtmlSimple(name || '(unnamed)')} <span class="muted">${escapeHtmlSimple(driverId)}</span></h3>
+        <div class="muted" style="margin-bottom:10px;font-size:12px">${list.length} settlement${list.length === 1 ? '' : 's'} · Total Net &#8377;${fmtNum(totalNet)}</div>
+      </div>
+      ${cumBtn}
+    </div>`;
 
   if (!list.length) {
     html += '<div class="muted">No settlements for this driver.</div>';
@@ -1411,6 +1559,57 @@ function openRecordFromFolder(id) {
   $('records-overlay').style.display = 'flex';
   openRecord(id);
 }
+
+// Merge every settlement for one driver into a single render bundle (same shape as
+// bundleFromStored) so renderSettlementPdf prints one statement with all trips and
+// advances listed and every money total summed across the driver's settlements.
+function bundleFromManySettlements(driverId) {
+  const num = v => Number(v) || 0;
+  const docs = _driverRecordsAll
+    .filter(r => String(r['Driver ID'] || '') === driverId)
+    .sort((a, b) => String(a['Date'] || '').localeCompare(String(b['Date'] || '')));
+  if (!docs.length) throw new Error('No settlements found for this driver.');
+
+  const periodsFrom = docs.map(s => s['Period From'] || '').filter(Boolean).sort();
+  const periodsTo = docs.map(s => s['Period To'] || '').filter(Boolean).sort();
+  const sum = key => docs.reduce((t, s) => t + num(s[key]), 0);
+
+  // Same per-row mappings as bundleFromStored, flattened across every doc.
+  const tripRows = docs.flatMap(s => (s.trips || []).map(t => ({
+    date: t['Trip Date'], tripNo: t['Trip No'], vehicle: t['Vehicle'],
+    route: String(t['Route'] || '').replace(/→/g, '->'),
+    km: num(t['KMs Ran']), days: t['Trip Days'], pctLabel: (t['Trip %'] != null ? t['Trip %'] : 100) + '%',
+    fixed: num(t['Fixed Rate']) * (num(t['Trip %']) || 100) / 100, halt: num(t['Halt Total']),
+    expLoadUnload: num(t['Exp Loading/Unloading']), expRepairs: num(t['Exp Repairs']), expToll: num(t['Exp Toll']),
+    expRoad: num(t['Exp Road']), expOthers: num(t['Exp Others']), expTotal: num(t['Expenses Total']), settlement: num(t['Trip Settlement']),
+  }))).sort((a, b) => String(a.date || '').localeCompare(String(b.date || '')));
+
+  const advanceRows = docs.flatMap(s => (s.advances || []).map(a => ({
+    date: a['Advance Date'], mode: a['Mode'], type: a['Type'], amount: num(a['Amount']), deducted: a['Deducted'] === 'Yes',
+  }))).sort((a, b) => String(a.date || '').localeCompare(String(b.date || '')));
+
+  return {
+    driver: { name: docs[0]['Driver Name'] || '', id: driverId, phone: '' },
+    period: { from: periodsFrom[0] || '—', to: periodsTo[periodsTo.length - 1] || '—' },
+    settlementId: `Cumulative · ${docs.length} settlement${docs.length === 1 ? '' : 's'}`,
+    date: today(), status: 'Cumulative', paymentDate: '',
+    fileName: `Cumulative_${driverId}_AllSettlements.pdf`,
+    summary: {
+      gross: sum('Gross'),
+      incentive: sum('Incentive'), incentiveReason: '', penalty: sum('Penalty'), penaltyReason: '',
+      incentives: null, penalties: null,
+      cashAdv: sum('Cash Advances'), upiAdv: sum('UPI Advances'), accountAdv: sum('Account Advances'),
+      net: sum('Net Payable'),
+    },
+    tripRows,
+    advanceRows,
+    editLogRows: [],
+  };
+}
+window.downloadCumulativePdf = (driverId) => {
+  try { renderSettlementPdf(bundleFromManySettlements(driverId)); }
+  catch (e) { alert('Failed to build cumulative PDF: ' + (e.message || e)); }
+};
 
 window.openDriverRecordsModal = openDriverRecordsModal;
 window.closeDriverRecordsModal = closeDriverRecordsModal;
@@ -2426,6 +2625,7 @@ window.addManualAdvance = () => {
   const amount = Number($('man-adv-amount').value);
   const date = $('man-adv-date').value;
   const mode = $('man-adv-mode').value;
+  const type = ($('man-adv-type') && $('man-adv-type').value) || 'Trip Advance';
   const remark = $('man-adv-remark').value.trim();
   if (!amount || amount <= 0) { alert('Amount must be > 0'); return; }
   if (!date) { alert('Date required'); return; }
@@ -2436,10 +2636,36 @@ window.addManualAdvance = () => {
   const position = state.advances.filter(a => a.date === date && a.mode === mode && Math.round(Number(a.amount) || 0) === amt).length;
   const driverId = state.driver && state.driver.id;
   const rowKey = advanceRowKey(driverId, date, mode, amount, position);
-  state.advances.push({ amount, date, mode, remark, position, rowKey, removed: false, manual: true, carryOver: false });
+  // Type drives deductibility (isDeductibleAdvance): Trip Settlement / Salary are not deducted.
+  state.advances.push({ amount, date, mode, type, remark, position, rowKey, removed: false, manual: true, carryOver: false });
   ['man-adv-amount','man-adv-date','man-adv-remark'].forEach(id => $(id).value = '');
   renderAdvances();
 };
+
+// ---------- Wizard adjustments (multiple incentives / penalties) ----------
+function renderWizAdjustments() {
+  const rowsHtml = (rows, kind) => rows.length
+    ? `<table><thead><tr><th class="right">Amount ₹</th><th>Reason</th><th></th></tr></thead><tbody>${rows.map((r, i) => `<tr>
+        <td class="right num">${fmt(Number(r.amount) || 0)}</td>
+        <td>${escapeHtmlSimple(r.reason || '—')}</td>
+        <td class="right"><button class="danger small" type="button" onclick="wizRemove${kind}(${i})">Remove</button></td>
+      </tr>`).join('')}</tbody></table>`
+    : '<div class="muted">None added.</div>';
+  $('wiz-incentives').innerHTML = rowsHtml(state.incentives, 'Incentive');
+  $('wiz-penalties').innerHTML = rowsHtml(state.penalties, 'Penalty');
+}
+function wizAddAdj(arr, amtId, reasonId) {
+  const amount = Math.max(0, Number($(amtId).value) || 0);
+  const reason = ($(reasonId).value || '').trim();
+  if (!amount || amount <= 0) { alert('Amount must be greater than 0.'); return; }
+  arr.push({ amount, reason });
+  $(amtId).value = ''; $(reasonId).value = '';
+  renderWizAdjustments();
+}
+window.wizAddIncentive = () => wizAddAdj(state.incentives, 'wiz-inc-amount', 'wiz-inc-reason');
+window.wizAddPenalty   = () => wizAddAdj(state.penalties, 'wiz-pen-amount', 'wiz-pen-reason');
+window.wizRemoveIncentive = (i) => { state.incentives.splice(i, 1); renderWizAdjustments(); };
+window.wizRemovePenalty   = (i) => { state.penalties.splice(i, 1); renderWizAdjustments(); };
 
 $('to-step-5').addEventListener('click', () => {
   // Validate advance modes
@@ -2857,15 +3083,25 @@ $('to-step-6').addEventListener('click', () => {
       return;
     }
   }
+  renderWizAdjustments();
   goStep(6);
 });
 
 // ---------- Step 7: Summary ----------
 $('to-step-7').addEventListener('click', () => {
-  state.incentive = Math.max(0, Number($('incentive-amount').value || 0));
-  state.incentiveReason = $('incentive-reason').value.trim();
-  state.penalty = Math.max(0, Number($('penalty-amount').value || 0));
-  state.penaltyReason = $('penalty-reason').value.trim();
+  // Fold any amount typed into the add-row inputs but not yet "Added" so it isn't lost.
+  const incA = Number($('wiz-inc-amount').value) || 0;
+  if (incA > 0) state.incentives.push({ amount: incA, reason: ($('wiz-inc-reason').value || '').trim() });
+  const penA = Number($('wiz-pen-amount').value) || 0;
+  if (penA > 0) state.penalties.push({ amount: penA, reason: ($('wiz-pen-reason').value || '').trim() });
+  ['wiz-inc-amount','wiz-inc-reason','wiz-pen-amount','wiz-pen-reason'].forEach(id => { if ($(id)) $(id).value = ''; });
+  // Derive the scalar totals/reasons used by renderSummary, the PDF and buildSettlementPayload.
+  const sumAmt = arr => arr.reduce((t, x) => t + (Number(x.amount) || 0), 0);
+  const joinRe = arr => arr.map(x => (x.reason || '').trim()).filter(Boolean).join('; ');
+  state.incentive = sumAmt(state.incentives);
+  state.incentiveReason = joinRe(state.incentives);
+  state.penalty = sumAmt(state.penalties);
+  state.penaltyReason = joinRe(state.penalties);
   renderSummary();
   goStep(7);
 });
@@ -3001,6 +3237,8 @@ function buildSettlementPayload(sId, finalizedOn) {
     'Incentive Reason': state.incentiveReason,
     'Penalty': state.penalty,
     'Penalty Reason': state.penaltyReason,
+    incentives: (state.incentives || []).map(x => ({ amount: Number(x.amount) || 0, reason: x.reason || '' })),
+    penalties: (state.penalties || []).map(x => ({ amount: Number(x.amount) || 0, reason: x.reason || '' })),
     'Cash Advances': cashAdv,
     'UPI Advances': upiAdv,
     'Account Advances': accountAdv,
@@ -3182,6 +3420,7 @@ function bundleFromState() {
     summary: {
       gross: r.gross, incentive: state.incentive, incentiveReason: state.incentiveReason,
       penalty: state.penalty, penaltyReason: state.penaltyReason,
+      incentives: (state.incentives || []).slice(), penalties: (state.penalties || []).slice(),
       cashAdv: r.cashAdv, upiAdv: r.upiAdv, accountAdv: r.accountAdv, net: r.net,
     },
     tripRows: r.trips.map(({ ti, calc }) => ({
@@ -3216,6 +3455,7 @@ function bundleFromStored(id) {
     summary: {
       gross: num(s['Gross']), incentive: num(s['Incentive']), incentiveReason: s['Incentive Reason'] || '',
       penalty: num(s['Penalty']), penaltyReason: s['Penalty Reason'] || '',
+      incentives: Array.isArray(s.incentives) ? s.incentives : null, penalties: Array.isArray(s.penalties) ? s.penalties : null,
       cashAdv: num(s['Cash Advances']), upiAdv: num(s['UPI Advances']), accountAdv: num(s['Account Advances']), net: num(s['Net Payable']),
     },
     tripRows: trips.map(t => ({
@@ -3382,10 +3622,22 @@ function renderSettlementPdf(b) {
 
   // ---- Net Settlement summary (right) ----
   const sm = b.summary;
+  // List each incentive/penalty on its own line when the array carries more than one;
+  // otherwise keep the single-line format (also covers legacy scalar-only docs).
+  const adjLines = (arr, scalar, scalarReason, label, sign) => {
+    if (Array.isArray(arr) && arr.length > 1) {
+      return arr.map((x, i) => [`${label} ${i + 1} (${sign})` + ((x.reason || '').trim() ? `  (${x.reason.trim()})` : ''), fmtNum(Number(x.amount) || 0)]);
+    }
+    if (Array.isArray(arr) && arr.length === 1) {
+      const x = arr[0];
+      return [[`${label} (${sign})` + ((x.reason || '').trim() ? `  (${x.reason.trim()})` : ''), fmtNum(Number(x.amount) || 0)]];
+    }
+    return [[`${label} (${sign})` + (scalarReason ? `  (${scalarReason})` : ''), fmtNum(scalar)]];
+  };
   const sumLines = [
     ['Gross trip settlements', fmtNum(sm.gross)],
-    ['Incentive (+)', fmtNum(sm.incentive) + (sm.incentiveReason ? `  (${sm.incentiveReason})` : '')],
-    ['Penalty (−)', fmtNum(sm.penalty) + (sm.penaltyReason ? `  (${sm.penaltyReason})` : '')],
+    ...adjLines(sm.incentives, sm.incentive, sm.incentiveReason, 'Incentive', '+'),
+    ...adjLines(sm.penalties, sm.penalty, sm.penaltyReason, 'Penalty', '−'),
     ['Cash advances (−)', fmtNum(sm.cashAdv)],
     ['UPI advances (−)', fmtNum(sm.upiAdv)],
     ['Account advances (−)', fmtNum(sm.accountAdv)],
@@ -3469,7 +3721,7 @@ function renderSettlementPdf(b) {
   }
 
   const suffix = b.status === 'Paid' ? '_FINAL' : '';
-  doc.save(`Settlement_${b.driver.id}_${String(b.date || today()).replace(/-/g, '')}${suffix}.pdf`);
+  doc.save(b.fileName || `Settlement_${b.driver.id}_${String(b.date || today()).replace(/-/g, '')}${suffix}.pdf`);
 }
 
 // Done-step button: render the just-submitted settlement from live state.
@@ -3517,6 +3769,8 @@ function newSettlement() {
   state.trips = [];
   state.advances = [];
   state.tripInputs = [];
+  state.incentives = [];
+  state.penalties = [];
   state.result = null;
   $('driver-id').value = '';
   $('driver-info').innerHTML = '';
