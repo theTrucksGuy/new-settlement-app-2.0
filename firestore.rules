@@ -61,8 +61,12 @@ service cloud.firestore {
         // editedByUid must match the writer.
         allow create: if isManager()
           && request.resource.data.editedByUid == request.auth.uid;
-        // Audit trail is immutable.
-        allow update, delete: if false;
+        // Audit trail is immutable: entries can never be edited.
+        allow update: if false;
+        // Admins may remove entries — only as part of deleting the whole
+        // settlement (deleteSettlement cascades the editLog), which admins
+        // can already do. No way to tamper with a surviving record.
+        allow delete: if isAdmin();
       }
     }
 
