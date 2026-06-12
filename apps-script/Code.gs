@@ -9,8 +9,8 @@
  *   POST {action:"settledIndex"}            settled-trips index
  *   POST {action:"finalize", ...rows}       append driver-log + summary + truck + index rows
  *
- * Sources: dispatch | settlementData | driverDetails | allVehicle |
- *          historyTrip | historySummary | historyTruck | historyIndex
+ * Sources: dispatch | settlementData | driverDetails | allVehicle | dieselUrea |
+ *          attendance | historyTrip | historySummary | historyTruck | historyIndex
  *
  * Setup is documented in SETUP.md.
  */
@@ -31,6 +31,8 @@ const CONFIG = {
   cashSheetTab: 'CASH SHEET',
   driverDetailsTab: 'Driver Details',
   allVehicleTab: 'All Vehicle',
+  dieselUreaTab: 'DIESEL&UREA',   // per-truck diesel fillings (optional tab)
+  attendanceTab: 'Attendance',    // driver×day attendance grid (optional tab)
 
   /* History tabs (separate sheet). Auto-created on first finalize if missing.*/
   historyTripTab: 'Driver Log',
@@ -46,6 +48,8 @@ const SOURCES = {
   cashSheet:      () => [CONFIG.workbookId,        CONFIG.cashSheetTab],
   driverDetails:  () => [CONFIG.workbookId,        CONFIG.driverDetailsTab],
   allVehicle:     () => [CONFIG.workbookId,        CONFIG.allVehicleTab],
+  dieselUrea:     () => [CONFIG.workbookId,        CONFIG.dieselUreaTab],
+  attendance:     () => [CONFIG.workbookId,        CONFIG.attendanceTab],
   historyTrip:    () => [CONFIG.historySheetId,    CONFIG.historyTripTab],
   historySummary: () => [CONFIG.historySheetId,    CONFIG.historySummaryTab],
   historyTruck:   () => [CONFIG.historySheetId,    CONFIG.historyTruckTab],
@@ -71,6 +75,8 @@ function doGet(e) {
           cashSheet:      !!CONFIG.workbookId,
           driverDetails:  !!CONFIG.workbookId,
           allVehicle:     !!CONFIG.workbookId,
+          dieselUrea:     !!CONFIG.workbookId,
+          attendance:     !!CONFIG.workbookId,
           history:        !!CONFIG.historySheetId,
         },
       };

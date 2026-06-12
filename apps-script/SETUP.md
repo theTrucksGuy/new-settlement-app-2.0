@@ -14,7 +14,7 @@ DASHBOARD" only exists as an Excel file, upload it to Google Drive and open it
 with **Google Sheets** (File → Save as Google Sheets), or import it into a new
 Google Sheet. The tabs must keep these names:
 
-`DISPATCH SHEET` · `Settlement Data` · `Driver Details` · `All Vehicle`
+`DISPATCH SHEET` · `Settlement Data` · `Driver Details` · `All Vehicle` · `DIESEL&UREA` *(optional — per-truck diesel fillings shown during settlement)* · `Attendance` *(optional — driver×day grid shown after driver search)*
 
 ---
 

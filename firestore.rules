@@ -77,6 +77,21 @@ service cloud.firestore {
       allow read, create, update, delete: if isBasic();
     }
 
+    // ── Manual settled ranges ───────────────────────────────────────────
+    // Periods a driver was settled for OUTSIDE the software (paper/legacy),
+    // recorded by admins so the Coverage screen shows true gaps. Entries are
+    // add/remove only — no edits (remove and re-add to correct one).
+    match /manualSettledRanges/{rangeId} {
+      allow read: if isBasic();
+      allow create: if isAdmin()
+        && request.resource.data.addedBy == request.auth.uid
+        && request.resource.data.driverId is string
+        && request.resource.data.from is string
+        && request.resource.data.to is string;
+      allow update: if false;
+      allow delete: if isAdmin();
+    }
+
     // ── Default deny ────────────────────────────────────────────────────
     match /{document=**} {
       allow read, write: if false;

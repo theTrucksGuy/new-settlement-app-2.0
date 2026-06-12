@@ -122,6 +122,7 @@
     &nbsp;·&nbsp; <button class="secondary small" id="open-routes-btn" type="button" style="margin-left:6px">📋 Routes</button>
     &nbsp;<button class="secondary small" id="open-records-btn" type="button">🧾 Records</button>
     &nbsp;<button class="secondary small" id="open-driver-records-btn" type="button">📂 Folders</button>
+    &nbsp;<button class="secondary small" id="open-coverage-btn" type="button">📋 Coverage</button>
     &nbsp;·&nbsp; <span id="user-info" class="muted"></span>
   </div>
 </header>
@@ -252,6 +253,23 @@
   </div>
 </div>
 
+<!-- Settlement Coverage modal — all drivers, last settled, unsettled gaps -->
+<div id="coverage-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:200;align-items:center;justify-content:center;padding:24px">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;width:min(1050px,100%);max-height:90vh;overflow:auto;padding:22px;box-shadow:0 20px 60px rgba(0,0,0,0.4)">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px">
+      <div>
+        <h2 style="margin:0">📋 Settlement Coverage</h2>
+        <p class="muted" style="margin:4px 0 0">Every driver, their last settled date, and unsettled gaps. Admins can record ranges settled outside the software so gaps reflect reality.</p>
+      </div>
+      <button class="secondary small" type="button" onclick="closeCoverageModal()">✕</button>
+    </div>
+    <div style="margin-bottom:12px">
+      <input type="text" id="coverage-search" placeholder="🔍 Search Driver ID or Name…" style="width:100%;padding:8px 10px;font-size:14px" autocomplete="off" />
+    </div>
+    <div id="coverage-list"></div>
+  </div>
+</div>
+
 <main>
   <div class="stepper" id="stepper">
     <div class="pill" data-step="0">Upload</div>
@@ -293,7 +311,7 @@
 
     <!-- XLSX pane — two equal-weight panels: fetch (left) and upload (right) -->
     <div class="tab-pane" data-pane="xlsx">
-      <p class="muted">Auto-fetch a Google Sheets published workbook, or upload an <code>.xlsx</code> directly. Either way reads Dispatch, Driver Details, Money Advance, UPI Sheet, Cash Sheet, and All Vehicle.</p>
+      <p class="muted">Auto-fetch a Google Sheets published workbook, or upload an <code>.xlsx</code> directly. Either way reads Dispatch, Driver Details, Money Advance, UPI Sheet, Cash Sheet, All Vehicle — and Diesel &amp; Urea when the tab is present.</p>
       <div class="grid-2" style="gap:14px;align-items:stretch">
         <!-- Fetch panel (left) -->
         <div style="background:var(--panel-2);border:1px solid var(--border);border-radius:10px;padding:14px;display:flex;flex-direction:column">
@@ -323,6 +341,9 @@
       <div id="sheet-summary" style="margin-top:16px; display:none"></div>
     </div>
 
+    <!-- Diesel status — fillings come from the master workbook's DIESEL&UREA tab -->
+    <div id="diesel-status" class="muted" style="margin-top:12px;font-size:12px"></div>
+
     <div class="actions">
       <button id="to-step-1" disabled>Continue &rarr;</button>
     </div>
@@ -346,6 +367,7 @@
     <label>Driver ID (e.g. D02028)</label>
     <input type="text" id="driver-id" placeholder="D02028" autocomplete="off" />
     <div id="driver-info" style="margin-top:12px"></div>
+    <div id="driver-attendance" style="margin-top:12px"></div>
     <div class="actions between">
       <button class="secondary" onclick="goStep(0)">&larr; Back</button>
       <button id="to-step-2" disabled>Continue &rarr;</button>
@@ -442,6 +464,7 @@
   <!-- Step 6: Adjustments -->
   <section class="card" id="step-6">
     <h2>Step 7 &mdash; Final Adjustments</h2>
+    <div id="wiz-diesel"></div>
     <p class="muted" style="margin-top:0">Add any number of incentive and penalty lines. Each is listed separately on the settlement and PDF.</p>
     <div class="grid-2">
       <div>
@@ -549,6 +572,8 @@ const STORAGE = {
   driverLastSettlement: 'grubus_driver_last_settlement',
   proxyUrl: 'grubus_proxy_url',
   fetchUrl: 'grubus_fetch_url',
+  dieselRows: 'grubus_diesel_rows',
+  attendanceIndex: 'grubus_attendance_index',
 };
 
 const CONFIG = {
@@ -589,6 +614,16 @@ const state = {
   trips: [],
   advances: [],
   tripInputs: [],
+  // Diesel fillings (the workbook's DIESEL&UREA tab) — refreshed on every
+  // workbook load / proxy connect; cached in localStorage between sessions.
+  dieselRows: [],        // all parsed filling rows
+  dieselMeta: null,      // { label, loadedAt }
+  dieselMatches: [],     // fillings matched to the current wizard driver (computed at step 6)
+  // Attendance (the workbook's "Attendance" tab): one row per driver, one
+  // column per day, cell = vehicle number or OFF. Indexed for the day-level
+  // driver↔truck lookup used by the attendance panel and diesel matching.
+  attendanceIndex: {},   // { [driverId]: { name, days: { 'YYYY-MM-DD': 'CG08…'|'OFF' } } }
+  attendanceMeta: null,  // { label, loadedAt }
   incentive: 0,
   incentiveReason: '',
   penalty: 0,
@@ -1085,6 +1120,25 @@ function renderOpenedRecord() {
         ${canEdit ? `<td><input type="checkbox" data-kind="adv-remove" data-i="${i}" title="Remove this advance from the settlement; it returns to the carry-over pool" ${ro}></td>` : ''}
       </tr>`).join('')}</tbody></table>` : '<div class="muted">No advances on this settlement.</div>';
 
+  // Diesel fillings snapshotted at submit time (read-only — they're evidence the
+  // incentive/penalty decision was based on, not an editable part of the maths).
+  const dieselRows = Array.isArray(s.diesel) ? s.diesel : [];
+  const dieselHtml = dieselRows.length ? `<table><thead><tr>
+      <th>Date</th><th>Pump</th><th>Vehicle</th><th class="right">Qty (L)</th><th class="right">Rate</th><th class="right">Diesel ₹</th><th class="right">KM</th><th class="right">Urea ₹</th><th>Trip</th>
+    </tr></thead><tbody>
+      ${dieselRows.map(d => `<tr${d.weak ? ' style="opacity:.75"' : ''}>
+        <td>${escapeHtmlSimple(d.date || '—')}</td>
+        <td>${escapeHtmlSimple(d.pump || '—')}</td>
+        <td class="num">${escapeHtmlSimple(d.vehicle || '—')}</td>
+        <td class="right num">${(Number(d.qty) || 0).toFixed(2)}</td>
+        <td class="right num">${(Number(d.rate) || 0).toFixed(2)}</td>
+        <td class="right num">${fmtNum(Number(d.amount) || 0)}</td>
+        <td class="right num">${Number(d.km) ? fmtNum(Number(d.km)) : '—'}</td>
+        <td class="right num">${Number(d.ureaAmt) ? fmtNum(Number(d.ureaAmt)) : '—'}</td>
+        <td class="muted" style="font-size:11px">${escapeHtmlSimple(d.matchedTrips || '')}${d.via === 'attendance' ? ' (attendance)' : d.weak ? ' (period)' : ''}</td>
+      </tr>`).join('')}
+    </tbody></table>` : '';
+
   const editHtml = edits.length ? `<table><thead><tr><th>When</th><th>By</th><th>Field</th><th>Old &rarr; New</th></tr></thead><tbody>
       ${edits.map(e => `<tr><td>${escapeHtmlSimple(e.timestamp || '')}</td><td>${escapeHtmlSimple(e.editedBy || '')}</td><td>${escapeHtmlSimple((e.scope && e.scope !== 'summary' ? e.scope + ': ' : '') + (e.field || ''))}</td><td>${escapeHtmlSimple(String(e.oldValue) + ' → ' + String(e.newValue))}</td></tr>`).join('')}
       </tbody></table>` : '<div class="muted">No edits yet.</div>';
@@ -1144,6 +1198,7 @@ function renderOpenedRecord() {
     <h3 style="margin-top:12px">Advances</h3>
     ${advHtml}
     ${addAdvForm}
+    ${dieselHtml ? `<h3 style="margin-top:12px">Diesel <span class="muted" style="font-weight:normal">(from Driver Sheet, read-only)</span></h3>${dieselHtml}` : ''}
     <h3 style="margin-top:12px">Adjustments</h3>
     <div class="grid-2" style="gap:14px;align-items:start">
       <div><h4 style="margin:0 0 4px">Incentives (+)</h4>${adjTable(incs, 'inc', 'Incentive', '+')}</div>
@@ -1170,8 +1225,28 @@ function erEditable() {
   if (!isManager()) { alert('Only managers and admins can edit records.'); return null; }
   return s;
 }
-window.erAddIncentive = () => { const s = erEditable(); if (!s) return; (s.incentives = s.incentives || []).push({ amount: 0, reason: '' }); renderOpenedRecord(); };
-window.erAddPenalty   = () => { const s = erEditable(); if (!s) return; (s.penalties  = s.penalties  || []).push({ amount: 0, reason: '' }); renderOpenedRecord(); };
+// Unsaved edits live only in the DOM until Save reads them back (applyRecordEdits
+// diffs inputs against the cached doc to build the edit log, and bails with
+// "No changes" when nothing differs). So a plain re-render wipes in-progress
+// typing and ticked Remove boxes, while syncing DOM values INTO the cache would
+// erase the old-vs-new diff the audit log is built from. Instead: snapshot every
+// row input, re-render, restore by (kind, index, field). Rows the re-render adds
+// aren't in the snapshot and keep their fresh defaults.
+function erRerenderKeepingEdits() {
+  const keyOf = el => el.dataset.kind + '|' + el.dataset.i + '|' + (el.dataset.field || '');
+  const saved = new Map();
+  document.querySelectorAll('#records-list [data-kind]').forEach(el => {
+    saved.set(keyOf(el), el.type === 'checkbox' ? el.checked : el.value);
+  });
+  renderOpenedRecord();
+  document.querySelectorAll('#records-list [data-kind]').forEach(el => {
+    if (!saved.has(keyOf(el))) return;
+    const v = saved.get(keyOf(el));
+    if (el.type === 'checkbox') el.checked = v; else el.value = v;
+  });
+}
+window.erAddIncentive = () => { const s = erEditable(); if (!s) return; (s.incentives = s.incentives || []).push({ amount: 0, reason: '' }); erRerenderKeepingEdits(); };
+window.erAddPenalty   = () => { const s = erEditable(); if (!s) return; (s.penalties  = s.penalties  || []).push({ amount: 0, reason: '' }); erRerenderKeepingEdits(); };
 
 window.erAddAdvance = () => {
   const s = erEditable(); if (!s) return;
@@ -1193,7 +1268,7 @@ window.erAddAdvance = () => {
     'Advance Date': date, 'Mode': mode, 'Type': type, 'Amount': amt,
     'Deducted': isDeductibleAdvance({ type }) ? 'Yes' : 'No', 'Remark': remark, 'Row Key': rowKey,
   });
-  renderOpenedRecord();
+  erRerenderKeepingEdits();
 };
 
 window.erAddTrip = () => {
@@ -1209,7 +1284,7 @@ window.erAddTrip = () => {
     'Exp Loading/Unloading': 0, 'Exp Repairs': 0, 'Exp Toll': 0, 'Exp Road': 0, 'Exp Others': 0,
     'Notes': 'Manual entry',
   });
-  renderOpenedRecord();
+  erRerenderKeepingEdits();
 };
 
 // In-place recompute over a settlement doc (Firestore shape). Mutates and returns it.
@@ -1409,7 +1484,7 @@ async function deleteSettlement(id) {
 }
 
 function summaryOnly(s) {
-  const out = {}; const skip = new Set(['trips', 'advances', 'truckLog', 'createdAt', 'createdBy', 'createdByName', '_id']);
+  const out = {}; const skip = new Set(['trips', 'advances', 'truckLog', 'diesel', 'createdAt', 'createdBy', 'createdByName', '_id']);
   for (const k of Object.keys(s)) if (!skip.has(k)) out[k] = s[k];
   return out;
 }
@@ -1813,7 +1888,7 @@ async function connectAndLoad() {
     const ping = await proxyGet('ping');
     statusEl.innerHTML = '<div class="info"><span class="spinner"></span>Loading dispatch, settlement data &amp; drivers…</div>';
 
-    const [dispatch, advances, upi, cash, driverDetails, allVehicle, settledRes] = await Promise.all([
+    const [dispatch, advances, upi, cash, driverDetails, allVehicle, settledRes, dieselRaw, attendanceRaw] = await Promise.all([
       proxyGet('read', { which: 'dispatch' }).then(r => r.rows || []),
       proxyGet('read', { which: 'moneyAdvance' }).then(r => r.rows || []),
       proxyGet('read', { which: 'upiSheet' }).then(r => r.rows || []),
@@ -1821,6 +1896,10 @@ async function connectAndLoad() {
       proxyGet('read', { which: 'driverDetails' }).then(r => r.rows || []),
       proxyGet('read', { which: 'allVehicle' }).then(r => r.rows || []),
       proxyPost('settledIndex'),
+      // Older Code.gs deployments don't know these sources — degrade to null
+      // (keeps any previously cached data) instead of failing the connect.
+      proxyGet('read', { which: 'dieselUrea' }).then(r => r.rows || []).catch(() => null),
+      proxyGet('read', { which: 'attendance' }).then(r => r.rows || []).catch(() => null),
     ]);
 
     state.mode = 'sheets';
@@ -1837,6 +1916,21 @@ async function connectAndLoad() {
       cash,
     };
     state.vehicleClass = buildVehicleClass(allVehicle);
+    // Attendance from the same workbook via the proxy (null = old deployment).
+    if (Array.isArray(attendanceRaw) && attendanceRaw.length) {
+      setAttendance(attendanceRaw, 'proxy · Attendance');
+    }
+    // Diesel fillings from the same workbook via the proxy (null = old proxy
+    // deployment without the dieselUrea source — keep whatever is cached).
+    if (Array.isArray(dieselRaw)) {
+      const dieselRows = mapDieselRows(dieselRaw);
+      if (dieselRows.length) setDieselRows(dieselRows, 'proxy · DIESEL&UREA');
+      else renderDieselStatus('<span class="muted">proxy returned no diesel rows</span>');
+    } else {
+      renderDieselStatus(state.dieselRows.length
+        ? '<span class="muted">cached — redeploy apps-script/Code.gs to refresh diesel via the proxy</span>'
+        : '<span class="muted">proxy doesn\'t serve diesel yet — redeploy apps-script/Code.gs (see SETUP.md)</span>');
+    }
     // Coerce whatever the Apps Script proxy returns into the new {trips, deductedAdvances}
     // shape. The legacy proxy returns a flat {tripNo: meta} map; per-advance locking
     // relies on Firestore mode (proxy mode falls back to "no advance lock").
@@ -1950,6 +2044,21 @@ function processWorkbook(wb, sourceLabel) {
     <div class="info"><strong>Loaded.</strong> ${sourceLabel ? `<span class="muted">${escapeHtmlSimple(sourceLabel)}</span> &nbsp;·&nbsp; ` : ''}${counts}</div>
     <div class="muted">Sheets in workbook: ${sheetList}</div>
   `;
+  // Diesel rides along in the same workbook (DIESEL&UREA tab): refresh it on
+  // every load — the workbook is the single source of truth. A workbook
+  // WITHOUT the tab keeps whatever was loaded before (flagged as cached).
+  try {
+    const { sheetName, rows } = parseDieselWorkbook(wb);
+    if (rows.length) setDieselRows(rows, `${sourceLabel || 'workbook'} · ${sheetName}`);
+    else renderDieselStatus(state.dieselRows.length
+      ? '<span class="muted">this workbook has no DIESEL&UREA tab — keeping previously loaded fillings</span>'
+      : '<span class="muted">no DIESEL&UREA tab in this workbook</span>');
+  } catch (_) { /* diesel tab is optional — never block the main load */ }
+  // Attendance rides along the same way (one row per driver, one column per day).
+  try {
+    const attTab = findSheet(wb, 'attendance');
+    if (attTab) setAttendance(readSheet(wb, attTab), `${sourceLabel || 'workbook'} · ${attTab}`);
+  } catch (_) { /* attendance tab is optional too */ }
   $('to-step-1').disabled = false;
 }
 
@@ -2046,6 +2155,499 @@ $('file-input').addEventListener('change', e => {
   if (e.target.files[0]) loadWorkbook(e.target.files[0]);
 });
 
+// ---------- Diesel — the master workbook's DIESEL&UREA tab ----------
+// One row per filling: pump, DATE, vehicle, QTY (litres), RATE, DIESEL AMOUNT,
+// occasional KM (odometer) and urea cost. There is no driver column — fillings
+// are attributed to the driver being settled through the TRIPS (vehicle + date,
+// see dieselMatchesForWizard). The tab arrives with the same workbook the app
+// already loads (upload, published-URL fetch, or the Apps Script proxy).
+
+// Tolerant numeric parse: cells occasionally carry stray text/trailing dots.
+function dieselNum(v) {
+  if (v == null || v === '') return 0;
+  const n = typeof v === 'number' ? v : parseFloat(String(v).replace(/[^\d.\-]/g, ''));
+  return isFinite(n) ? n : 0;
+}
+function normVeh(v) { return String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); }
+
+// Shared row-mapper: works on objects from SheetJS (raw serial dates) and from
+// the Apps Script proxy (dates pre-formatted yyyy-MM-dd). Headers carry stray
+// spaces/dots ("PETROL PUMP ", "QTY.", "UREA AMT.") — match on letters only.
+function mapDieselRows(raw) {
+  const normKey = k => String(k).toUpperCase().replace(/[^A-Z]/g, '');
+  const FIELDS = {
+    PETROLPUMP: 'pump', DATE: 'date', VEHICLENO: 'vehicle', VEHICLENUMBER: 'vehicle',
+    QTY: 'qty', RATE: 'rate', DIESELAMOUNT: 'amount', DESIELAMOUNT: 'amount',
+    KM: 'km', UREAAMT: 'ureaAmt', UREAAMOUNT: 'ureaAmt', COMMENT: 'comment',
+  };
+  return raw.map(r => {
+    const o = {};
+    Object.keys(r).forEach(k => { const f = FIELDS[normKey(k)]; if (f && o[f] === undefined) o[f] = r[k]; });
+    return {
+      pump: String(o.pump || '').trim(),
+      date: parseDate(o.date),
+      vehicle: String(o.vehicle || '').trim().toUpperCase(),
+      vehKey: normVeh(o.vehicle),
+      qty: dieselNum(o.qty),
+      rate: dieselNum(o.rate),
+      amount: dieselNum(o.amount),
+      km: dieselNum(o.km),
+      ureaAmt: dieselNum(o.ureaAmt),
+      comment: String(o.comment || '').trim(),
+    };
+  }).filter(r => r.vehKey && r.date && (r.qty || r.amount));
+}
+
+function parseDieselWorkbook(wb) {
+  // "DIESEL&UREA" is the canonical tab. The needles are checked per-tab in
+  // workbook order; no earlier tab of the master workbook contains them.
+  const sheetName = findSheet(wb, 'diesel', 'dsl');
+  if (!sheetName) return { sheetName: null, rows: [] };
+  return { sheetName, rows: mapDieselRows(readSheet(wb, sheetName)) };
+}
+
+function renderDieselStatus(note) {
+  const el = $('diesel-status');
+  if (!el) return;
+  const meta = state.dieselMeta;
+  if (state.dieselRows.length && meta) {
+    el.innerHTML = `⛽ Diesel: <strong>${state.dieselRows.length}</strong> filling rows
+      <span class="muted">(${escapeHtmlSimple(meta.label)} · ${escapeHtmlSimple(meta.loadedAt)})</span>${note ? ' — ' + note : ''}
+      — shown per driver on the Final Adjustments step and printed on the PDF.`;
+  } else {
+    el.innerHTML = `⛽ No diesel data yet — it loads automatically from the workbook's <code>DIESEL&amp;UREA</code> tab.${note ? ' ' + note : ''}`;
+  }
+}
+
+function setDieselRows(rows, label) {
+  state.dieselRows = rows;
+  state.dieselMeta = { label, loadedAt: new Date().toLocaleString('en-IN') };
+  try { localStorage.setItem(STORAGE.dieselRows, JSON.stringify({ rows, meta: state.dieselMeta })); }
+  catch (_) {
+    // Quota/blocked storage: drop the OLD cache too, or the next reload would
+    // silently resurrect a stale dataset over this in-memory one.
+    try { localStorage.removeItem(STORAGE.dieselRows); } catch (_) {}
+  }
+  renderDieselStatus();
+}
+
+// Restore the cached diesel rows on boot (the workbook refreshes them on every
+// load). Re-coerce every field — an older-schema cache with, say, a string
+// `qty` would otherwise throw inside the step-6 renderer and silently freeze
+// the wizard's Continue button.
+try {
+  const cached = JSON.parse(localStorage.getItem(STORAGE.dieselRows) || 'null');
+  if (cached && Array.isArray(cached.rows) && cached.rows.length) {
+    state.dieselRows = cached.rows.map(r => ({
+      pump: String(r.pump || ''), date: r.date || null,
+      vehicle: String(r.vehicle || ''), vehKey: r.vehKey || normVeh(r.vehicle),
+      qty: dieselNum(r.qty), rate: dieselNum(r.rate), amount: dieselNum(r.amount),
+      km: dieselNum(r.km), ureaAmt: dieselNum(r.ureaAmt), comment: String(r.comment || ''),
+    })).filter(r => r.vehKey && r.date);
+    state.dieselMeta = cached.meta || { label: 'cached', loadedAt: '' };
+  }
+} catch (_) { /* corrupt cache — ignore */ }
+renderDieselStatus(state.dieselRows.length ? '<span class="muted">cached — reload the workbook for the latest fillings</span>' : '');
+
+// ---------- Attendance — the master workbook's "Attendance" tab ----------
+// One row per driver; one column per day (headers like "01-04-2026"); cell =
+// vehicle number the driver was on that day, or OFF, or blank. This is the
+// day-level driver↔truck record: it powers the attendance panel on the Driver
+// step, restricts diesel fillings to days the driver actually had the truck,
+// and (via state.sheets.attendance) the per-trip attendance anomaly flags.
+
+function buildAttendanceIndex(rawRows) {
+  const idx = {};
+  (rawRows || []).forEach(row => {
+    const keys = Object.keys(row);
+    const idCol = keys.find(k => /driver\s*id|emp\s*id/i.test(k));
+    if (!idCol) return;
+    const id = String(row[idCol] || '').trim().toUpperCase();
+    if (!id) return;
+    const nameCol = keys.find(k => /driver\s*name|^name$/i.test(k));
+    const entry = idx[id] || (idx[id] = { name: '', days: {} });
+    if (nameCol && row[nameCol]) entry.name = String(row[nameCol]).trim();
+    keys.forEach(k => {
+      if (k === idCol || k === nameCol) return;
+      // Header "01-04-2026" → "2026-04-01". A purely numeric header is an Excel
+      // serial date (number-formatted cell) — parse as a number, not a string
+      // (new Date('46113') would invent year 46113).
+      const day = parseDate(/^\d+(\.\d+)?$/.test(k) ? Number(k) : k);
+      if (!day) return;                    // skips Phone Number etc.
+      const v = String(row[k] == null ? '' : row[k]).trim();
+      if (v) entry.days[day] = v.toUpperCase();
+    });
+  });
+  return idx;
+}
+
+function setAttendance(rawRows, label) {
+  state.sheets.attendance = rawRows || [];
+  state.attendanceIndex = buildAttendanceIndex(rawRows);
+  state.attendanceMeta = { label, loadedAt: new Date().toLocaleString('en-IN') };
+  try { localStorage.setItem(STORAGE.attendanceIndex, JSON.stringify({ index: state.attendanceIndex, meta: state.attendanceMeta })); }
+  catch (_) { try { localStorage.removeItem(STORAGE.attendanceIndex); } catch (_) {} }
+}
+
+// Restore the cached attendance index on boot (raw rows are NOT cached — the
+// per-trip anomaly flags need a real load, same as before; the panel and
+// diesel matching work off this index).
+try {
+  const cached = JSON.parse(localStorage.getItem(STORAGE.attendanceIndex) || 'null');
+  if (cached && cached.index && typeof cached.index === 'object') {
+    state.attendanceIndex = cached.index;
+    state.attendanceMeta = cached.meta || { label: 'cached', loadedAt: '' };
+  }
+} catch (_) { /* corrupt cache — ignore */ }
+
+// Day-level truth: was this driver on this vehicle that day?
+//   'yes'     — attendance says driver was on exactly this truck
+//   'no'      — attendance says OFF or a different truck
+//   'unknown' — no attendance record for that day
+function attendanceSaysOnVehicle(driverId, day, vehKey) {
+  const entry = state.attendanceIndex[String(driverId || '').trim().toUpperCase()];
+  const v = entry && entry.days ? entry.days[day] : undefined;
+  if (!v) return 'unknown';
+  return normVeh(v) === vehKey ? 'yes' : 'no';
+}
+
+function renderDriverAttendance(driverId) {
+  const c = $('driver-attendance');
+  if (!c) return;
+  if (!driverId) { c.innerHTML = ''; return; }
+  const entry = state.attendanceIndex[String(driverId).trim().toUpperCase()];
+  if (!entry || !Object.keys(entry.days).length) {
+    c.innerHTML = Object.keys(state.attendanceIndex).length
+      ? '<div class="muted" style="padding:8px 10px;border:1px dashed var(--border);border-radius:8px">📅 No attendance recorded for this driver in the workbook\'s Attendance tab.</div>'
+      : '<div class="muted" style="padding:8px 10px;border:1px dashed var(--border);border-radius:8px">📅 No attendance data — the workbook loaded on Step 1 had no Attendance tab (or the proxy needs the updated Code.gs).</div>';
+    return;
+  }
+  const days = Object.keys(entry.days).sort();
+  const byMonth = {};
+  days.forEach(d => { (byMonth[d.slice(0, 7)] = byMonth[d.slice(0, 7)] || []).push(d); });
+  const monthName = ym => new Date(ym + '-01T00:00:00').toLocaleString('en-IN', { month: 'long', year: 'numeric' });
+  const monthsHtml = Object.keys(byMonth).sort().map(ym => {
+    const list = byMonth[ym];
+    const driving = list.filter(d => entry.days[d] !== 'OFF');
+    const off = list.length - driving.length;
+    const trucks = [...new Set(driving.map(d => entry.days[d]))];
+    const chips = list.map(d => {
+      const v = entry.days[d];
+      const isOff = v === 'OFF';
+      const style = isOff
+        ? 'background:var(--panel-2);color:var(--muted);border:1px solid var(--border)'
+        : 'background:rgba(46,160,67,.15);color:var(--ok);border:1px solid var(--ok)';
+      return `<span title="${escapeHtmlSimple(d + ' — ' + v)}" style="display:inline-block;min-width:26px;text-align:center;padding:2px 3px;border-radius:5px;font-size:10px;font-family:monospace;${style}">${Number(d.slice(8, 10))}</span>`;
+    }).join(' ');
+    return `<div style="margin-top:8px">
+      <div style="font-size:12px;margin-bottom:4px"><strong>${escapeHtmlSimple(monthName(ym))}</strong>
+        <span class="muted">— ${driving.length} day${driving.length === 1 ? '' : 's'} driving${off ? ', ' + off + ' OFF' : ''}${trucks.length ? ' · ' + trucks.map(escapeHtmlSimple).join(', ') : ''}</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:3px">${chips}</div>
+    </div>`;
+  }).join('');
+  c.innerHTML = `<div style="background:var(--panel-2);border:1px solid var(--border);border-radius:10px;padding:12px">
+    <div style="font-size:13px">📅 <strong>Attendance</strong> <span class="muted">— from the workbook's Attendance tab; hover a day for the truck. Days without a chip have no record.</span></div>
+    ${monthsHtml}
+  </div>`;
+}
+
+// ---------- Settlement Coverage (all drivers · last settled · unsettled gaps) ----------
+// Coverage = in-app settlements (Firestore) + manual ranges admins record for
+// settlements done OUTSIDE the software (collection manualSettledRanges).
+// Period semantics match the wizard: a range (from, to] is contiguous with the
+// next when next.from === prev.to; a gap is the uncovered span between them.
+const coverage = {
+  settlements: [], manual: [], loaded: false, error: '', addFor: null, search: '',
+  selectMode: false, selected: {},   // multi-select for the bulk "settled till date" action (admin)
+  filterActive: false,               // show only drivers present in the last 15 days
+  shownIds: [],                      // ids currently rendered (after search/filter) — for "select all shown"
+};
+
+// Active = present (assigned a truck, not OFF) on at least one of the last 15
+// days, per the workbook's Attendance tab.
+function isDriverActive(id) {
+  const e = state.attendanceIndex[id];
+  if (!e || !e.days) return false;
+  const t = today();
+  const floor = minusDays(t, 15);
+  return Object.keys(e.days).some(d => d > floor && d <= t && e.days[d] !== 'OFF');
+}
+
+async function fetchCoverageData() {
+  const [setSnap, manSnap] = await Promise.all([
+    fbDb.collection('settlements').get(),
+    // Collection may not exist / rules not deployed yet — treat as empty.
+    fbDb.collection('manualSettledRanges').get().catch(() => null),
+  ]);
+  coverage.settlements = setSnap.docs.map(d => {
+    const s = d.data();
+    return {
+      id: d.id,
+      driverId: String(s['Driver ID'] || '').trim().toUpperCase(),
+      driverName: String(s['Driver Name'] || '').trim(),
+      from: String(s['Period From'] || ''), to: String(s['Period To'] || ''),
+      status: s['Status'] || 'Submitted',
+    };
+  }).filter(s => s.driverId && s.from && s.to);
+  coverage.manual = manSnap ? manSnap.docs.map(d => {
+    const m = d.data();
+    return {
+      _id: d.id,
+      driverId: String(m.driverId || '').trim().toUpperCase(),
+      from: String(m.from || ''), to: String(m.to || ''),
+      note: String(m.note || ''), addedByName: String(m.addedByName || ''),
+    };
+  }).filter(m => m.driverId && m.from && m.to) : [];
+  coverage.loaded = true;
+}
+
+// Every driver we know about, from every source: Driver Details sheet,
+// attendance index, settlements, manual ranges. Map id → best-known name.
+function coverageRoster() {
+  const roster = {};
+  const put = (id, name) => {
+    id = String(id || '').trim().toUpperCase();
+    if (!id || !/^D\d|^DMRD/i.test(id)) return;   // skip junk ids from stray rows
+    if (!(id in roster)) roster[id] = '';
+    const n = String(name || '').trim();
+    if (n && !roster[id]) roster[id] = n;
+  };
+  (state.sheets.driverDetails || []).forEach(row => {
+    const keys = Object.keys(row);
+    const idCol = keys.find(k => /id\s*no|driver\s*id|emp\s*id|^id$/i.test(k));
+    const nameCol = keys.find(k => /^name$|driver\s*name/i.test(k));
+    if (idCol) put(row[idCol], nameCol ? row[nameCol] : '');
+  });
+  Object.keys(state.attendanceIndex || {}).forEach(id => put(id, state.attendanceIndex[id].name));
+  coverage.settlements.forEach(s => put(s.driverId, s.driverName));
+  coverage.manual.forEach(m => put(m.driverId, ''));
+  return roster;
+}
+
+function mergeCoverageRanges(ranges) {
+  const rs = ranges
+    .map(r => (r.from <= r.to ? { from: r.from, to: r.to } : { from: r.to, to: r.from }))
+    .sort((a, b) => a.from.localeCompare(b.from) || a.to.localeCompare(b.to));
+  const merged = [];
+  rs.forEach(r => {
+    const last = merged[merged.length - 1];
+    if (last && r.from <= last.to) { if (r.to > last.to) last.to = r.to; }
+    else merged.push({ from: r.from, to: r.to });
+  });
+  return merged;
+}
+
+function coverageDays(a, b) { return Math.round((new Date(b) - new Date(a)) / 86400000); }
+
+function computeCoverage() {
+  const roster = coverageRoster();
+  const byDriver = {};
+  coverage.settlements.forEach(s => (byDriver[s.driverId] = byDriver[s.driverId] || []).push(s));
+  coverage.manual.forEach(m => (byDriver[m.driverId] = byDriver[m.driverId] || []).push(m));
+  const t = today();
+  return Object.keys(roster).map(id => {
+    const ranges = byDriver[id] || [];
+    const merged = mergeCoverageRanges(ranges);
+    const lastTo = merged.length ? merged[merged.length - 1].to : null;
+    const gaps = [];
+    for (let i = 0; i + 1 < merged.length; i++) {
+      if (merged[i + 1].from > merged[i].to) {
+        gaps.push({ from: merged[i].to, to: merged[i + 1].from, days: coverageDays(merged[i].to, merged[i + 1].from) });
+      }
+    }
+    return {
+      id, name: roster[id], lastTo, gaps,
+      sinceDays: lastTo ? Math.max(0, coverageDays(lastTo, t)) : null,
+      inApp: ranges.length - coverage.manual.filter(m => m.driverId === id).length,
+      manualRanges: coverage.manual.filter(m => m.driverId === id),
+      active: isDriverActive(id),
+    };
+  });
+}
+
+function renderCoverage() {
+  const c = $('coverage-list');
+  if (!c) return;
+  if (coverage.error) { c.innerHTML = `<div class="err-box">${escapeHtmlSimple(coverage.error)}</div>`; return; }
+  if (!coverage.loaded) { c.innerHTML = '<div class="muted"><span class="spinner"></span>Loading settlements…</div>'; return; }
+  const admin = isAdmin();
+  const sel = coverage.selectMode && admin;
+  const q = (coverage.search || '').trim().toUpperCase();
+  let rows = computeCoverage();
+  const activeCount = rows.filter(r => r.active).length;
+  if (coverage.filterActive) rows = rows.filter(r => r.active);
+  if (q) rows = rows.filter(r => r.id.includes(q) || (r.name || '').toUpperCase().includes(q));
+  // Most urgent first: never settled, then longest time since last settlement.
+  rows.sort((a, b) => {
+    if ((a.lastTo === null) !== (b.lastTo === null)) return a.lastTo === null ? -1 : 1;
+    return (b.sinceDays || 0) - (a.sinceDays || 0) || a.id.localeCompare(b.id);
+  });
+  coverage.shownIds = rows.map(r => r.id);
+  const settledCount = rows.filter(r => r.lastTo !== null).length;
+  const selCount = Object.keys(coverage.selected).length;
+  const sinceBadge = r => {
+    if (r.lastTo === null) return '<span class="badge bad">never settled</span>';
+    if (r.sinceDays > 30) return `<span class="badge bad">${r.sinceDays} days</span>`;
+    if (r.sinceDays > 15) return `<span class="badge warn">${r.sinceDays} days</span>`;
+    return `<span class="badge ok">${r.sinceDays} days</span>`;
+  };
+  const toolbar = `
+    <div class="actions" style="justify-content:flex-start;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+      <button class="secondary small" type="button" onclick="coverage.filterActive=!coverage.filterActive;renderCoverage()">${coverage.filterActive ? '☑' : '☐'} Active only <span class="muted">(${activeCount})</span></button>
+      ${admin ? (sel ? `
+        <button class="secondary small" type="button" onclick="coverageSelectActive()">Select all active</button>
+        <button class="secondary small" type="button" onclick="coverageSelectShown()">Select all shown</button>
+        <button class="secondary small" type="button" onclick="coverage.selected={};renderCoverage()">Clear selection</button>
+        <button class="small" type="button" ${selCount ? '' : 'disabled'} onclick="coverageBulkSettle()">✓ Mark <span id="cov-sel-count">${selCount}</span> selected settled till today</button>
+        <button class="secondary small" type="button" onclick="coverage.selectMode=false;coverage.selected={};renderCoverage()">Cancel</button>
+      ` : `<button class="secondary small" type="button" onclick="coverage.selectMode=true;renderCoverage()">☑ Select multiple</button>`) : ''}
+    </div>`;
+  const bodyHtml = rows.map(r => {
+    const gapsHtml = r.gaps.length
+      ? r.gaps.map(g => `<span class="badge warn" title="Uncovered between settled ranges">${escapeHtmlSimple(g.from)} → ${escapeHtmlSimple(g.to)} (${g.days}d)</span>`).join(' ')
+      : (r.lastTo === null ? '<span class="muted">—</span>' : '<span class="muted">none</span>');
+    const manualHtml = r.manualRanges.map(m =>
+      `<span class="badge muted" title="${escapeHtmlSimple('Settled outside the software' + (m.note ? ' — ' + m.note : '') + (m.addedByName ? ' (added by ' + m.addedByName + ')' : ''))}">✍ ${escapeHtmlSimple(m.from)} → ${escapeHtmlSimple(m.to)}${admin ? ` <a href="#" onclick="coverageDeleteRange('${m._id}');return false" title="Remove this manual range" style="color:var(--bad);text-decoration:none">✕</a>` : ''}</span>`
+    ).join(' ');
+    const addForm = coverage.addFor === r.id ? `
+      <tr style="background:var(--panel-2)"><td colspan="${sel ? 7 : 6}" style="padding:8px 10px">
+        <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap">
+          <div><label class="muted" style="font-size:11px">Settled From</label><input type="date" id="cov-add-from"></div>
+          <div><label class="muted" style="font-size:11px">Settled To</label><input type="date" id="cov-add-to"></div>
+          <div style="flex:1;min-width:160px"><label class="muted" style="font-size:11px">Note (e.g. paper settlement no.)</label><input type="text" id="cov-add-note" placeholder="optional"></div>
+          <button class="small" type="button" onclick="coverageSaveRange('${r.id}')">Save</button>
+          <button class="secondary small" type="button" onclick="coverage.addFor=null;renderCoverage()">Cancel</button>
+        </div>
+      </td></tr>` : '';
+    return `<tr>
+      ${sel ? `<td><input type="checkbox" ${coverage.selected[r.id] ? 'checked' : ''} onchange="coverageToggleSelect('${r.id}', this.checked)"></td>` : ''}
+      <td><strong>${escapeHtmlSimple(r.id)}</strong>${r.active ? ' <span class="badge ok" title="Present at least one day in the last 15 days (Attendance tab)">active</span>' : ''}<div class="muted" style="font-size:11px">${escapeHtmlSimple(r.name || '')}</div></td>
+      <td>${r.lastTo ? escapeHtmlSimple(r.lastTo) : '<span class="muted">—</span>'}</td>
+      <td>${sinceBadge(r)}</td>
+      <td>${gapsHtml}</td>
+      <td>${r.inApp ? r.inApp + ' in-app' : '<span class="muted">0</span>'}${manualHtml ? '<div style="margin-top:3px">' + manualHtml + '</div>' : ''}</td>
+      <td>${admin ? `<button class="secondary small" type="button" onclick="coverage.addFor='${r.id}';renderCoverage()">+ Add range</button>` : ''}</td>
+    </tr>${addForm}`;
+  }).join('');
+  c.innerHTML = `
+    ${toolbar}
+    <div class="muted" style="margin-bottom:8px;font-size:12px">${rows.length} driver${rows.length === 1 ? '' : 's'}${q || coverage.filterActive ? ' shown' : ''} · ${settledCount} with settlements on record · ${activeCount} active in last 15 days${admin ? ' · ✍ = settled outside the software (admin-recorded)' : ''}</div>
+    <table><thead><tr>
+      ${sel ? '<th></th>' : ''}<th>Driver</th><th>Last settled up to</th><th>Unsettled for</th><th>Gaps between settlements</th><th>Settled ranges</th><th></th>
+    </tr></thead><tbody>${bodyHtml || `<tr><td colspan="${sel ? 7 : 6}" class="muted">No drivers found.</td></tr>`}</tbody></table>`;
+}
+
+window.coverageToggleSelect = (id, checked) => {
+  if (checked) coverage.selected[id] = true; else delete coverage.selected[id];
+  // Update count + disabled state in place — a full re-render would reset the
+  // modal's scroll position on every tick.
+  const span = $('cov-sel-count');
+  if (span) {
+    const n = Object.keys(coverage.selected).length;
+    span.textContent = n;
+    const btn = span.closest('button');
+    if (btn) btn.disabled = !n;
+  }
+};
+window.coverageSelectActive = () => {
+  computeCoverage().filter(r => r.active).forEach(r => { coverage.selected[r.id] = true; });
+  renderCoverage();
+};
+window.coverageSelectShown = () => {
+  coverage.shownIds.forEach(id => { coverage.selected[id] = true; });
+  renderCoverage();
+};
+
+// Bulk action: the admin asserts every selected driver has been fully settled
+// (outside the software where needed) up to today — one manual range from the
+// epoch floor to today per driver, which clears their gaps and resets the
+// "unsettled for" clock. Drivers already covered through today are skipped.
+window.coverageBulkSettle = async () => {
+  if (!isAdmin()) { alert('Only admins can record manual settled ranges.'); return; }
+  const t = today();
+  const byId = {};
+  computeCoverage().forEach(r => { byId[r.id] = r; });
+  const ids = Object.keys(coverage.selected);
+  const target = ids.filter(id => !(byId[id] && byId[id].lastTo && byId[id].lastTo >= t));
+  const skipped = ids.length - target.length;
+  if (!target.length) { alert('All selected drivers are already settled through today.'); return; }
+  if (!confirm(`Mark ${target.length} driver${target.length === 1 ? '' : 's'} as settled till ${t}?` +
+    (skipped ? ` (${skipped} already settled through today will be skipped.)` : '') +
+    ' This records one manual range per driver and clears their gaps.')) return;
+  try {
+    let batch = fbDb.batch(), n = 0;
+    for (const id of target) {
+      batch.set(fbDb.collection('manualSettledRanges').doc(), {
+        driverId: id, from: '2000-01-01', to: t,
+        note: 'Marked settled till date (bulk)',
+        addedBy: currentUser.uid, addedByName: currentUser.name || currentUser.email || '',
+        addedAt: new Date().toISOString(),
+      });
+      if (++n % 400 === 0) { await batch.commit(); batch = fbDb.batch(); }
+    }
+    await batch.commit();
+  } catch (err) { alert('Bulk save failed: ' + (err.message || err)); return; }
+  coverage.selected = {};
+  coverage.selectMode = false;
+  try { await fetchCoverageData(); } catch (_) {}
+  renderCoverage();
+};
+
+async function openCoverageModal() {
+  $('coverage-overlay').style.display = 'flex';
+  coverage.addFor = null;
+  coverage.selectMode = false;
+  coverage.selected = {};
+  if (!FIREBASE_READY || !currentUser.uid) {
+    coverage.error = 'Sign in to view settlement coverage.';
+    renderCoverage();
+    return;
+  }
+  coverage.error = '';
+  coverage.loaded = false;
+  renderCoverage();
+  try {
+    await fetchCoverageData();
+  } catch (err) {
+    coverage.error = 'Failed to load: ' + (err.message || err);
+  }
+  renderCoverage();
+}
+function closeCoverageModal() { $('coverage-overlay').style.display = 'none'; }
+window.closeCoverageModal = closeCoverageModal;
+
+window.coverageSaveRange = async (driverId) => {
+  if (!isAdmin()) { alert('Only admins can record manual settled ranges.'); return; }
+  const from = $('cov-add-from').value, to = $('cov-add-to').value;
+  const note = ($('cov-add-note').value || '').trim();
+  if (!from || !to) { alert('Both dates are required.'); return; }
+  if (from > to) { alert('"Settled From" must not be after "Settled To".'); return; }
+  try {
+    await fbDb.collection('manualSettledRanges').add({
+      driverId, from, to, note,
+      addedBy: currentUser.uid, addedByName: currentUser.name || currentUser.email || '',
+      addedAt: new Date().toISOString(),
+    });
+  } catch (err) { alert('Save failed: ' + (err.message || err)); return; }
+  coverage.addFor = null;
+  try { await fetchCoverageData(); } catch (_) {}
+  renderCoverage();
+};
+
+window.coverageDeleteRange = async (rangeId) => {
+  if (!isAdmin()) { alert('Only admins can remove manual settled ranges.'); return; }
+  if (!confirm('Remove this manually recorded settled range? The period it covered will show as unsettled again.')) return;
+  try { await fbDb.collection('manualSettledRanges').doc(rangeId).delete(); }
+  catch (err) { alert('Delete failed: ' + (err.message || err)); return; }
+  try { await fetchCoverageData(); } catch (_) {}
+  renderCoverage();
+};
+
+$('open-coverage-btn').addEventListener('click', openCoverageModal);
+$('coverage-overlay').addEventListener('click', (e) => { if (e.target.id === 'coverage-overlay') closeCoverageModal(); });
+$('coverage-search').addEventListener('input', () => { coverage.search = $('coverage-search').value; renderCoverage(); });
+
 // Auto-fetch URL wiring. Persist the last-used URL per browser so admins
 // don't paste it on every load.
 $('fetch-url').value = localStorage.getItem(STORAGE.fetchUrl) || '';
@@ -2092,16 +2694,19 @@ $('driver-id').addEventListener('input', () => {
   const v = $('driver-id').value.trim();
   if (!v) {
     $('driver-info').innerHTML = '';
+    renderDriverAttendance(null);
     $('to-step-2').disabled = true;
     return;
   }
   const drv = findDriver(v);
   if (drv) {
     $('driver-info').innerHTML = `<div class="info"><strong>${drv.name}</strong> &nbsp;·&nbsp; ID: ${drv.id} ${drv.phone ? `&nbsp;·&nbsp; ${drv.phone}` : ''}</div>`;
+    renderDriverAttendance(drv.id);
     $('to-step-2').disabled = false;
     state.driver = drv;
   } else {
     $('driver-info').innerHTML = `<div class="err-box">Driver ID not found in Driver Details or Dispatch.</div>`;
+    renderDriverAttendance(null);
     $('to-step-2').disabled = true;
     state.driver = null;
   }
@@ -2642,6 +3247,98 @@ window.addManualAdvance = () => {
   renderAdvances();
 };
 
+// ---------- Wizard diesel panel (between per-trip questions and adjustments) ----------
+// A filling counts ONLY for days this driver was actually on that truck —
+// never just "same truck, somewhere in the period" (the truck may have had a
+// different driver on other days). Day-level authority is the Attendance tab:
+//   attendance says driver was on this truck that day → match
+//   attendance says OFF or a different truck         → drop
+//   no attendance record for that day                → fall back to the trips:
+//     match only inside a trip's window [start, end] (end missing → until the
+//     next trip starts on the same vehicle; last trip → its start day only).
+function dieselMatchesForWizard() {
+  const rows = state.dieselRows || [];
+  if (!rows.length || !state.tripInputs || !state.tripInputs.length) return [];
+  const trips = state.tripInputs.map(ti => ti.trip);
+  const pf = state.periodFrom || '0000-00-00';
+  const pt = state.periodTo || '9999-99-99';
+  const driverId = state.driver && state.driver.id;
+  const byVeh = {};
+  trips.forEach(t => {
+    if (!t.tripStart) return;
+    (byVeh[normVeh(t.vehicle)] = byVeh[normVeh(t.vehicle)] || []).push(t);
+  });
+  const windows = [];
+  Object.keys(byVeh).forEach(vk => {
+    const vt = byVeh[vk].slice().sort((a, b) => a.tripStart.localeCompare(b.tripStart));
+    vt.forEach((t, i) => {
+      const next = vt[i + 1];
+      const end = t.tripEnd || (next ? next.tripStart : t.tripStart);
+      windows.push({ vehKey: vk, from: t.tripStart, to: end, tripNo: t.tripNo });
+    });
+  });
+  const out = [];
+  rows.forEach(r => {
+    if (!byVeh[r.vehKey] || !r.date) return;
+    // Period bounds mirror trip selection: a filling exactly ON periodFrom
+    // belongs to the previous settlement; one on periodTo belongs to this one.
+    if (!(r.date > pf && r.date <= pt)) return;
+    const att = attendanceSaysOnVehicle(driverId, r.date, r.vehKey);
+    if (att === 'no') return;            // recorded on OFF / another truck that day
+    const hits = windows.filter(w => w.vehKey === r.vehKey && r.date >= w.from && r.date <= w.to);
+    if (att === 'unknown' && !hits.length) return;   // no record AND outside every trip
+    out.push(Object.assign({}, r, {
+      matchedTrips: [...new Set(hits.map(w => w.tripNo).filter(Boolean))].join(', '),
+      via: hits.length ? 'trip' : 'attendance',
+    }));
+  });
+  // Chronological; per-day order follows the sheet.
+  return out.sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function renderWizDiesel() {
+  const c = $('wiz-diesel');
+  if (!c) return;
+  if (!(state.dieselRows || []).length) {
+    c.innerHTML = `<div class="muted" style="margin:0 0 14px;padding:8px 10px;border:1px dashed var(--border);border-radius:8px">⛽ No diesel data — the workbook loaded on Step 1 had no <code>DIESEL&amp;UREA</code> tab (or the proxy needs the updated Code.gs).</div>`;
+    return;
+  }
+  const rows = state.dieselMatches || [];
+  if (!rows.length) {
+    c.innerHTML = `<div class="muted" style="margin:0 0 14px;padding:8px 10px;border:1px dashed var(--border);border-radius:8px">⛽ ${state.dieselRows.length} diesel fillings loaded, but none fall on this driver's trucks within ${escapeHtmlSimple(state.periodFrom || '?')} → ${escapeHtmlSimple(state.periodTo || '?')}.</div>`;
+    return;
+  }
+  const totQty = rows.reduce((s, r) => s + r.qty, 0);
+  const totAmt = rows.reduce((s, r) => s + r.amount, 0);
+  const totUrea = rows.reduce((s, r) => s + r.ureaAmt, 0);
+  c.innerHTML = `
+    <h3 style="margin:0 0 6px">⛽ Diesel — ${rows.length} filling${rows.length === 1 ? '' : 's'} while this driver had the truck</h3>
+    <p class="muted" style="margin:0 0 8px;font-size:12px">From the workbook's DIESEL&amp;UREA tab — only days the Attendance tab or a trip places <em>this</em> driver on that truck. Other drivers' days on the same truck are excluded. Nothing is deducted automatically.</p>
+    <table style="margin-bottom:14px"><thead><tr>
+      <th>Date</th><th>Pump</th><th>Vehicle</th><th class="right">Qty (L)</th><th class="right">Rate</th><th class="right">Diesel ₹</th><th class="right">KM</th><th class="right">Urea ₹</th><th>Trip</th>
+    </tr></thead><tbody>
+      ${rows.map(r => `<tr>
+        <td>${escapeHtmlSimple(r.date)}</td>
+        <td>${escapeHtmlSimple(r.pump || '—')}</td>
+        <td class="num">${escapeHtmlSimple(r.vehicle)}</td>
+        <td class="right num">${r.qty ? r.qty.toFixed(2) : '—'}</td>
+        <td class="right num">${r.rate ? r.rate.toFixed(2) : '—'}</td>
+        <td class="right num">${fmtNum(r.amount)}</td>
+        <td class="right num">${r.km ? fmtNum(r.km) : '—'}</td>
+        <td class="right num">${r.ureaAmt ? fmtNum(r.ureaAmt) : '—'}</td>
+        <td class="muted" style="font-size:11px">${escapeHtmlSimple(r.matchedTrips || '')}${r.via === 'attendance' ? ' <span title="No trip window covers this day, but the Attendance tab records the driver on this truck">(attendance)</span>' : ''}</td>
+      </tr>`).join('')}
+    </tbody><tfoot><tr>
+      <td colspan="3" class="right" style="font-weight:600">Totals</td>
+      <td class="right num" style="font-weight:600">${totQty.toFixed(2)}</td>
+      <td></td>
+      <td class="right num" style="font-weight:600">${fmtNum(totAmt)}</td>
+      <td></td>
+      <td class="right num" style="font-weight:600">${totUrea ? fmtNum(totUrea) : '—'}</td>
+      <td class="muted">${totQty ? 'avg ' + (totAmt / totQty).toFixed(2) + ' ₹/L' : ''}</td>
+    </tr></tfoot></table>`;
+}
+
 // ---------- Wizard adjustments (multiple incentives / penalties) ----------
 function renderWizAdjustments() {
   const rowsHtml = (rows, kind) => rows.length
@@ -3083,6 +3780,8 @@ $('to-step-6').addEventListener('click', () => {
       return;
     }
   }
+  state.dieselMatches = dieselMatchesForWizard();
+  renderWizDiesel();
   renderWizAdjustments();
   goStep(6);
 });
@@ -3239,6 +3938,14 @@ function buildSettlementPayload(sId, finalizedOn) {
     'Penalty Reason': state.penaltyReason,
     incentives: (state.incentives || []).map(x => ({ amount: Number(x.amount) || 0, reason: x.reason || '' })),
     penalties: (state.penalties || []).map(x => ({ amount: Number(x.amount) || 0, reason: x.reason || '' })),
+    // Diesel fillings matched to this driver via trips (vehicle + date) —
+    // flat Firestore-safe objects; printed on the PDF and shown in Records.
+    diesel: (state.dieselMatches || []).map(d => ({
+      date: d.date || '', pump: d.pump || '', vehicle: d.vehicle || '',
+      qty: Number(d.qty) || 0, rate: Number(d.rate) || 0, amount: Number(d.amount) || 0,
+      km: Number(d.km) || 0, ureaAmt: Number(d.ureaAmt) || 0,
+      matchedTrips: d.matchedTrips || '', via: d.via || 'trip',
+    })),
     'Cash Advances': cashAdv,
     'UPI Advances': upiAdv,
     'Account Advances': accountAdv,
@@ -3436,6 +4143,7 @@ function bundleFromState() {
     advanceRows: r.pdfAdvanceRows || state.advances.filter(a => !a.removed).map(a => ({
       date: a.date, mode: a.mode, type: a.type, amount: a.amount, deducted: isDeductibleAdvance(a),
     })),
+    dieselRows: (state.dieselMatches || []).slice(),
     editLogRows: [],
   };
 }
@@ -3471,6 +4179,7 @@ function bundleFromStored(id) {
     advanceRows: advances.map(a => ({
       date: a['Advance Date'], mode: a['Mode'], type: a['Type'], amount: num(a['Amount']), deducted: a['Deducted'] === 'Yes',
     })),
+    dieselRows: Array.isArray(s.diesel) ? s.diesel : [],
     editLogRows: edits.map(e => ({
       timestamp: e.timestamp, editedBy: e.editedBy, scope: e.scope, field: e.field, oldValue: e.oldValue, newValue: e.newValue,
     })),
@@ -3549,6 +4258,38 @@ function renderSettlementPdf(b) {
     },
   });
   y = doc.lastAutoTable.finalY + 6;
+
+  // ----- Diesel fillings (DIESEL&UREA) — only when any matched this driver -----
+  if (b.dieselRows && b.dieselRows.length) {
+    const dQty = b.dieselRows.reduce((s, d) => s + (Number(d.qty) || 0), 0);
+    const dAmt = b.dieselRows.reduce((s, d) => s + (Number(d.amount) || 0), 0);
+    const dUrea = b.dieselRows.reduce((s, d) => s + (Number(d.ureaAmt) || 0), 0);
+    ensure(24);
+    sectionAt('Diesel Fillings (DIESEL&UREA)', 14, y); y += 2.5;
+    doc.autoTable({
+      startY: y,
+      head: [['Date', 'Pump', 'Vehicle', 'Qty (L)', 'Rate', 'Diesel Rs', 'KM', 'Urea Rs', 'Trip']],
+      body: b.dieselRows.map(d => [
+        d.date || '—', d.pump || '—', d.vehicle || '—',
+        (Number(d.qty) || 0).toFixed(2), (Number(d.rate) || 0).toFixed(2), fmtNum(Number(d.amount) || 0),
+        Number(d.km) ? fmtNum(Number(d.km)) : '—', Number(d.ureaAmt) ? fmtNum(Number(d.ureaAmt)) : '—',
+        (d.matchedTrips || '') + (d.via === 'attendance' ? ' (att.)' : d.weak ? ' (period)' : ''),
+      ]),
+      foot: [[{ content: `Totals (${b.dieselRows.length})`, colSpan: 3, styles: { halign: 'right' } },
+        dQty.toFixed(2), '', fmtNum(dAmt), '', dUrea ? fmtNum(dUrea) : '—',
+        dQty ? `avg ${(dAmt / dQty).toFixed(2)} Rs/L` : '']],
+      styles: { fontSize: 7, cellPadding: 1.6, overflow: 'linebreak' },
+      headStyles: { fillColor: NAVY, textColor: GOLD, fontSize: 7 },
+      footStyles: FOOT,
+      alternateRowStyles: { fillColor: STRIPE },
+      margin: { bottom: FOOTER_RESERVED },
+      columnStyles: {
+        3: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right' },
+        6: { halign: 'right' }, 7: { halign: 'right' },
+      },
+    });
+    y = doc.lastAutoTable.finalY + 6;
+  }
 
   // ----- Advances (split into 2 columns: read top→bottom of col1, then col2) +
   //       Net Settlement on the right — all three side by side -----
@@ -3771,9 +4512,11 @@ function newSettlement() {
   state.tripInputs = [];
   state.incentives = [];
   state.penalties = [];
+  state.dieselMatches = [];   // diesel ROWS stay loaded; matches are per-driver
   state.result = null;
   $('driver-id').value = '';
   $('driver-info').innerHTML = '';
+  renderDriverAttendance(null);
   $('to-step-2').disabled = true;
   goStep(1);
 }
