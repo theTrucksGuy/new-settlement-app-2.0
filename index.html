@@ -1888,7 +1888,7 @@ async function connectAndLoad() {
     const ping = await proxyGet('ping');
     statusEl.innerHTML = '<div class="info"><span class="spinner"></span>Loading dispatch, settlement data &amp; drivers…</div>';
 
-    const [dispatch, advances, upi, cash, driverDetails, allVehicle, settledRes, dieselRaw, attendanceRaw] = await Promise.all([
+    const [dispatch, advances, upi, cash, driverDetails, allVehicle, settledRes, dieselRaw, diesel2Raw, attendanceRaw] = await Promise.all([
       proxyGet('read', { which: 'dispatch' }).then(r => r.rows || []),
       proxyGet('read', { which: 'moneyAdvance' }).then(r => r.rows || []),
       proxyGet('read', { which: 'upiSheet' }).then(r => r.rows || []),
@@ -1899,6 +1899,7 @@ async function connectAndLoad() {
       // Older Code.gs deployments don't know these sources — degrade to null
       // (keeps any previously cached data) instead of failing the connect.
       proxyGet('read', { which: 'dieselUrea' }).then(r => r.rows || []).catch(() => null),
+      proxyGet('read', { which: 'dieselUrea2' }).then(r => r.rows || []).catch(() => null),
       proxyGet('read', { which: 'attendance' }).then(r => r.rows || []).catch(() => null),
     ]);
 
@@ -1921,10 +1922,15 @@ async function connectAndLoad() {
       setAttendance(attendanceRaw, 'proxy · Attendance');
     }
     // Diesel fillings from the same workbook via the proxy (null = old proxy
-    // deployment without the dieselUrea source — keep whatever is cached).
-    if (Array.isArray(dieselRaw)) {
-      const dieselRows = mapDieselRows(dieselRaw);
-      if (dieselRows.length) setDieselRows(dieselRows, 'proxy · DIESEL&UREA');
+    // deployment without the dieselUrea sources — keep whatever is cached).
+    // Both tabs are merged with the same dedupe as the workbook path: the
+    // curated DIESEL&UREA first, then D&U for the fillings it alone carries.
+    if (Array.isArray(dieselRaw) || Array.isArray(diesel2Raw)) {
+      const dieselRows = mergeDieselRows([
+        mapDieselRows(dieselRaw || []),
+        mapDieselRows(diesel2Raw || []),
+      ]);
+      if (dieselRows.length) setDieselRows(dieselRows, 'proxy · DIESEL&UREA + D&U');
       else renderDieselStatus('<span class="muted">proxy returned no diesel rows</span>');
     } else {
       renderDieselStatus(state.dieselRows.length
@@ -2176,7 +2182,9 @@ function normVeh(v) { return String(v || '').toUpperCase().replace(/[^A-Z0-9]/g,
 function mapDieselRows(raw) {
   const normKey = k => String(k).toUpperCase().replace(/[^A-Z]/g, '');
   const FIELDS = {
-    PETROLPUMP: 'pump', DATE: 'date', VEHICLENO: 'vehicle', VEHICLENUMBER: 'vehicle',
+    // NECESSITYS is the (mislabeled) date column header on the D&U tab.
+    PETROLPUMP: 'pump', DATE: 'date', NECESSITYS: 'date',
+    VEHICLENO: 'vehicle', VEHICLENUMBER: 'vehicle',
     QTY: 'qty', RATE: 'rate', DIESELAMOUNT: 'amount', DESIELAMOUNT: 'amount',
     KM: 'km', UREAAMT: 'ureaAmt', UREAAMOUNT: 'ureaAmt', COMMENT: 'comment',
   };
@@ -2198,12 +2206,35 @@ function mapDieselRows(raw) {
   }).filter(r => r.vehKey && r.date && (r.qty || r.amount));
 }
 
+// The workbook keeps OVERLAPPING copies of the diesel ledger ("DIESEL&UREA"
+// is the curated tab, "D&U" the running tab with the newest fillings) and
+// neither alone is complete. Merge them with a multiset-dedupe on
+// (date, vehicle, qty): earlier tabs win; later tabs only contribute fillings
+// not already present. Two GENUINE same-day same-qty fills survive (each tab
+// lists both), but the same fill recorded in both tabs isn't double-counted.
+function mergeDieselRows(rowSets) {
+  const taken = {};   // key → occurrences already contributed by earlier tabs
+  const out = [];
+  rowSets.forEach(rows => {
+    const local = {};
+    rows.forEach(r => {
+      const k = r.date + '|' + r.vehKey + '|' + (Number(r.qty) || 0).toFixed(2);
+      local[k] = (local[k] || 0) + 1;
+      if (local[k] > (taken[k] || 0)) out.push(r);
+    });
+    Object.keys(local).forEach(k => { taken[k] = Math.max(taken[k] || 0, local[k]); });
+  });
+  return out;
+}
+
 function parseDieselWorkbook(wb) {
-  // "DIESEL&UREA" is the canonical tab. The needles are checked per-tab in
-  // workbook order; no earlier tab of the master workbook contains them.
-  const sheetName = findSheet(wb, 'diesel', 'dsl');
-  if (!sheetName) return { sheetName: null, rows: [] };
-  return { sheetName, rows: mapDieselRows(readSheet(wb, sheetName)) };
+  // Every diesel-ish tab: DIESEL&UREA, D&U, DSL… "diesel"-named tabs are the
+  // curated ones — read them first so the dedupe prefers their rows.
+  const tabs = wb.SheetNames.filter(n => /diesel|dsl|^d\s*&\s*u$/i.test(String(n).trim()));
+  if (!tabs.length) return { sheetName: null, rows: [] };
+  tabs.sort((x, y) => (/diesel/i.test(y) ? 1 : 0) - (/diesel/i.test(x) ? 1 : 0));
+  const rows = mergeDieselRows(tabs.map(t => mapDieselRows(readSheet(wb, t))));
+  return { sheetName: tabs.join(' + '), rows };
 }
 
 function renderDieselStatus(note) {

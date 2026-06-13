@@ -31,7 +31,8 @@ const CONFIG = {
   cashSheetTab: 'CASH SHEET',
   driverDetailsTab: 'Driver Details',
   allVehicleTab: 'All Vehicle',
-  dieselUreaTab: 'DIESEL&UREA',   // per-truck diesel fillings (optional tab)
+  dieselUreaTab: 'DIESEL&UREA',   // per-truck diesel fillings, curated tab (optional)
+  dieselUrea2Tab: 'D&U',          // running diesel tab with the newest fillings (optional)
   attendanceTab: 'Attendance',    // driver×day attendance grid (optional tab)
 
   /* History tabs (separate sheet). Auto-created on first finalize if missing.*/
@@ -49,6 +50,7 @@ const SOURCES = {
   driverDetails:  () => [CONFIG.workbookId,        CONFIG.driverDetailsTab],
   allVehicle:     () => [CONFIG.workbookId,        CONFIG.allVehicleTab],
   dieselUrea:     () => [CONFIG.workbookId,        CONFIG.dieselUreaTab],
+  dieselUrea2:    () => [CONFIG.workbookId,        CONFIG.dieselUrea2Tab],
   attendance:     () => [CONFIG.workbookId,        CONFIG.attendanceTab],
   historyTrip:    () => [CONFIG.historySheetId,    CONFIG.historyTripTab],
   historySummary: () => [CONFIG.historySheetId,    CONFIG.historySummaryTab],
